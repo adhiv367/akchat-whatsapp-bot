@@ -300,7 +300,9 @@ def search(query, products, top_k=3):
         score = len(query_words.intersection(doc_words))
         scores.append((score, p["text"]))
     scores.sort(reverse=True)
-    return [text for _, text in scores[:top_k]]
+    # Only keep genuine matches — zero-overlap "matches" are noise that
+    # confuses Groq into mixing unrelated products with real history
+    return [text for score, text in scores[:top_k] if score > 0]
 def get_top_product_images(query, products, top_k=5):
     """Return list of matching products with sku, name, and image for suggestion replies"""
     query_words = set(query.lower().split())
@@ -472,7 +474,7 @@ Customer Message: {query}
 Instructions:
 - Reply friendly and short like a boutique staff on WhatsApp
 - If customer says hi or hello, greet them and introduce Invi Creation
-- If the recent conversation above answers part of the question (e.g. a price or product already mentioned), use it — don't ask the customer to repeat themselves
+- If the recent conversation above answers part of the question (e.g. a price or product already mentioned), use it exactly as stated there — don't substitute a different product from "Relevant Products" below, even if it seems similar
 - If customer asks to suggest, show, or recommend dresses — show 5 products like this format EXACTLY:
 
 1. 👗 *Product Name*
