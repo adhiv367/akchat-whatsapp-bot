@@ -323,7 +323,54 @@ def get_top_product_images(query, products, top_k=5):
     return results
 DRESS_KEYWORDS = ["dress", "dresses", "kurthi", "kurthis", "salwar", "outfit", "clothes"]
 
-def build_suggestion_reply(query, products, top_k=5, exclude_skus=None):
+# PHASE 3: color words for interest tracking (category detection reuses
+# the existing CATEGORY_WORDS already defined inside build_suggestion_reply)
+COLOR_WORDS = [
+    "red", "blue", "green", "yellow", "pink", "purple", "black", "white",
+    "orange", "maroon", "wine", "navy", "grey", "gray", "ivory", "mustard",
+    "olive", "mint", "indigo", "rust", "forest",
+]
+
+
+def detect_color(text):
+    text_lower = text.lower()
+    for c in COLOR_WORDS:
+        if c in text_lower:
+            return c
+    return None
+
+
+def log_customer_interest(customer_id, product_sku, product_name, category):
+    """PHASE 3: records that this customer was shown a product, for later
+    matching against new arrivals. Fail-quiet, same as other DB helpers."""
+    if not customer_id or not category:
+        return
+    color = detect_color(product_name)
+    conn = get_db_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO coexistence.customer_interests
+                    (workspace_id, customer_number, product_sku, product_category, product_color)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (workspace_id, customer_number, product_category, product_color)
+                    WHERE status = 'open'
+                    DO NOTHING
+                """,
+                (1, customer_id, product_sku, category, color),
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] log_customer_interest failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer_id=None):
     """Pick real distinct products and build a clean suggestion reply directly (no Groq)"""
     query_lower = query.lower()
     query_words = set(query_lower.split())
@@ -382,6 +429,9 @@ def build_suggestion_reply(query, products, top_k=5, exclude_skus=None):
     # If not enough fresh products, fill remaining slots from fallback (already-shown ones)
     if len(picked) < top_k:
         picked.extend(fallback[:top_k - len(picked)])
+
+    for details in picked:
+        log_customer_interest(customer_id, details.get("SKU", ""), details.get("Product", ""), matched_category)
 
     if not picked:
         return "Sorry, I couldn't find matching products right now. You can browse our full collection at https://www.invicreation.com 😊", None, []
@@ -592,7 +642,7 @@ def ai_reply():
     suggest_keywords = ["suggest", "show me", "recommend", "options", "collection"] + DRESS_KEYWORDS
     if any(kw in msg_lower for kw in suggest_keywords):
         already_shown = get_recent_skus(customer_id)
-        reply, top_image, image_list = build_suggestion_reply(message, products, top_k=5, exclude_skus=already_shown)
+        reply, top_image, image_list = build_suggestion_reply(message, products, top_k=5, exclude_skus=already_shown, customer_id=customer_id)
         shown_skus = [item["sku"] for item in image_list]
         remember_skus(customer_id, shown_skus)
         print(f"[SUGGEST] {message} (customer={customer_id}) -> {len(image_list)} products, excluded {len(already_shown)}")
