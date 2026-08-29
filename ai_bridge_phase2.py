@@ -323,6 +323,42 @@ def get_top_product_images(query, products, top_k=5):
     return results
 DRESS_KEYWORDS = ["dress", "dresses", "kurthi", "kurthis", "salwar", "outfit", "clothes"]
 
+# PHASE 5: policy/FAQ keywords for detecting a second intent alongside a
+# product question (e.g. "is it available AND can I get delivery by Friday")
+POLICY_KEYWORDS = [
+    "delivery", "deliver", "ship", "shipping", "return", "refund", "exchange",
+    "cash on delivery", "cod", "payment", "pay by", "store hours", "store timing",
+    "how long", "when will i get", "dry clean", "wash", "care instructions",
+]
+
+def search_policy_faq(message, limit=2):
+    """PHASE 5: simple keyword search against the FAQ/policy knowledge base
+    (built in Phase 1). No embeddings, no extra API calls — just a plain
+    database search, matching this bot's existing style of preferring
+    simple rules over AI where possible."""
+    msg_lower = message.lower()
+    matched_terms = [kw for kw in POLICY_KEYWORDS if kw in msg_lower]
+    if not matched_terms:
+        return []
+    conn = get_db_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            conditions = " OR ".join(["chunk_text ILIKE %s"] * len(matched_terms))
+            params = [f"%{term}%" for term in matched_terms]
+            cur.execute(
+                f"SELECT DISTINCT chunk_text FROM coexistence.knowledge_chunks "
+                f"WHERE workspace_id = %s AND ({conditions}) LIMIT %s",
+                [1] + params + [limit],
+            )
+            return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        print(f"[PHASE5] search_policy_faq failed: {e}")
+        return []
+    finally:
+        conn.close()
+
 # PHASE 3: color words for interest tracking (category detection reuses
 # the existing CATEGORY_WORDS already defined inside build_suggestion_reply)
 COLOR_WORDS = [
@@ -341,6 +377,7 @@ def detect_color(text):
 
 
 def log_customer_interest(customer_id, product_sku, product_name, category):
+    print(f"[DEBUG] log_customer_interest called: customer_id={customer_id}, sku={product_sku}, category={category}")
     """PHASE 3: records that this customer was shown a product, for later
     matching against new arrivals. Fail-quiet, same as other DB helpers."""
     if not customer_id or not category:
@@ -497,13 +534,16 @@ def build_collection_overview_reply(products):
 # in the prompt when present. Callers that don't pass it (there are none
 # currently, but this keeps the function backward-compatible) behave exactly
 # as before.
-def ask_groq(query, context, conversation_history=None):
+def ask_groq(query, context, conversation_history=None, policy_context=None):
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
 
     # PHASE 2: format recent turns as a simple transcript, if any exist.
+    policy_block = ""
+    if policy_context:
+        policy_block = "Relevant store policy/FAQ info:\n" + "\n---\n".join(policy_context) + "\n\n"
     history_block = ""
     if conversation_history:
         lines = []
@@ -516,7 +556,7 @@ def ask_groq(query, context, conversation_history=None):
 Website: https://www.invicreation.com
 Phone: 9751100905
 
-{history_block}Relevant Products:
+{history_block}{policy_block}Relevant Products:
 {chr(10).join(context)}
 
 Customer Message: {query}
@@ -640,7 +680,8 @@ def ai_reply():
 
     # ── 4b. Dress/collection suggestion — build directly from real data, no Groq ──
     suggest_keywords = ["suggest", "show me", "recommend", "options", "collection"] + DRESS_KEYWORDS
-    if any(kw in msg_lower for kw in suggest_keywords):
+    has_policy_question = any(kw in msg_lower for kw in POLICY_KEYWORDS)  # PHASE 5
+    if any(kw in msg_lower for kw in suggest_keywords) and not has_policy_question:  # PHASE 5: fall through to Groq if a policy question is also present
         already_shown = get_recent_skus(customer_id)
         reply, top_image, image_list = build_suggestion_reply(message, products, top_k=5, exclude_skus=already_shown, customer_id=customer_id)
         shown_skus = [item["sku"] for item in image_list]
@@ -655,8 +696,9 @@ def ai_reply():
         })
     # ── 5. General question — call Groq ──
     context = search(message, products)
+    policy_context = search_policy_faq(message)  # PHASE 5
     conversation_history = get_recent_conversation(customer_id)  # PHASE 2
-    reply = ask_groq(message, context, conversation_history)     # PHASE 2: history added
+    reply = ask_groq(message, context, conversation_history, policy_context)  # PHASE 5: policy added
     print(f"[GROQ] {message}")
     log_message(customer_id, "outgoing", reply)  # PHASE 2
     return jsonify({
@@ -664,7 +706,96 @@ def ai_reply():
         "image": None,
         "type": "text"
     })
-@app.route("/shopify/product-created", methods=["POST"])
+CATEGORY_WORDS_MATCH = {
+    "maxi": ["maxi"],
+    "kurthi": ["kurthi", "kurta", "kurti"],
+    "salwar": ["salwar", "suit set", "ethnic wear set"],
+    "co-ord": ["co-ord", "coord", "co ord"],
+}
+
+NODE_BACKEND_URL = os.environ.get("NODE_BACKEND_URL", "http://localhost:3011")
+
+
+def detect_category(text):
+    text_lower = text.lower()
+    for cat, words in CATEGORY_WORDS_MATCH.items():
+        if any(w in text_lower for w in words):
+            return cat
+    return None
+
+
+INTEREST_TEMPLATE_ID = os.environ.get("INTEREST_TEMPLATE_ID")  # set once Meta approves the template
+
+def prepare_followup_for_interest(interest_id, customer_number, category, color, sku, product_name, product_handle):
+    """PHASE 3: creates a DRAFT broadcast for manual review — never sends
+    automatically. Marks the interest 'match_found' (NOT 'contacted' —
+    that only happens once a human actually clicks Send in the real
+    Broadcast UI, which is outside this bot's control entirely)."""
+    if not INTEREST_TEMPLATE_ID:
+        print("[PHASE3] INTEREST_TEMPLATE_ID not set yet — skipping, template pending Meta approval")
+        return
+
+    product_link = f"https://www.invicreation.com/products/{product_handle}" if product_handle else "https://www.invicreation.com"
+    variable_mapping = {
+        "1": f"{color} {category}",
+        "2": product_name,
+        "3": product_link,
+    }
+    try:
+        resp = requests.post(
+            NODE_BACKEND_URL + "/api/internal/prepare-followup",
+            json={
+                "customer_number": customer_number,
+                "template_id": int(INTEREST_TEMPLATE_ID),
+                "name": f"Interest follow-up: {customer_number} — {color} {category}",
+                "variable_mapping": variable_mapping,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            conn = get_db_conn()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE coexistence.customer_interests SET status = %s, matched_sku = %s, updated_at = NOW() WHERE id = %s",
+                            ("match_found", sku, interest_id),
+                        )
+                    conn.commit()
+                    print(f"[PHASE3] Draft ready for review: {customer_number} — {sku}")
+                finally:
+                    conn.close()
+        else:
+            print(f"[PHASE3] Prepare failed for interest {interest_id}: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[PHASE3] Prepare error for interest {interest_id}: {e}")
+
+
+def notify_matching_interests(sku, product_name, doc_text):
+    category = detect_category(doc_text)
+    color = detect_color(doc_text)
+    if not category or not color:
+        return
+    handle_match = [line for line in doc_text.split("\n") if line.startswith("Handle:")]
+    product_handle = handle_match[0].split(":", 1)[1].strip() if handle_match else ""
+    conn = get_db_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, customer_number FROM coexistence.customer_interests WHERE workspace_id = %s AND status = %s AND product_category = %s AND product_color = %s",
+                (1, "open", category, color),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"[PHASE3] notify_matching_interests query failed: {e}")
+        rows = []
+    finally:
+        conn.close()
+
+    for interest_id, customer_number in rows:
+        prepare_followup_for_interest(interest_id, customer_number, category, color, sku, product_name, product_handle)
 def shopify_product_created():
     data = request.json
     product = data.get('product') or data
@@ -678,6 +809,8 @@ def shopify_product_created():
         products.append(doc)
         save_products(products)
         print(f"[SHOPIFY] Added new product: {doc['id']}")
+        details = parse_product_details(doc)
+        notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
         return jsonify({"status": "added", "id": doc['id']})
     print(f"[SHOPIFY] Product already exists: {doc['id']}")
     return jsonify({"status": "already exists"})
@@ -702,6 +835,9 @@ def shopify_product_updated():
         products.append(doc)
     save_products(products)
     print(f"[SHOPIFY] Updated product: {doc['id']} (published={is_published})")
+    if is_published:
+        details = parse_product_details(doc)
+        notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
     return jsonify({"status": "updated"})
 
 
