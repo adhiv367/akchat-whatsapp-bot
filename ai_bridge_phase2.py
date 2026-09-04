@@ -1,4 +1,4 @@
-﻿from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
 import requests
@@ -31,12 +31,12 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # PHASE 2: DATABASE_URL must be set on Render (same Postgres your AK Chat
-# backend already uses â€” Settings â†’ Environment on the Render service).
+# backend already uses — Settings → Environment on the Render service).
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 def get_db_conn():
-    """PHASE 2: single place to open a DB connection. Never throws upward â€”
+    """PHASE 2: single place to open a DB connection. Never throws upward —
     every caller below treats a failed connection the same way the old code
     treated a fresh/empty dict: just proceeds with no memory for this turn,
     rather than crashing the whole request."""
@@ -51,7 +51,7 @@ def get_db_conn():
 
 # PHASE 2: get_recent_skus / remember_skus now read/write Postgres instead of
 # the old `recent_suggestions = {}` dict. Same function names, same call
-# sites below â€” nothing else in the file needed to change for this part.
+# sites below — nothing else in the file needed to change for this part.
 
 def get_recent_skus(customer_id):
     if not customer_id:
@@ -99,7 +99,7 @@ def remember_skus(customer_id, skus):
         conn.close()
 
 
-# PHASE 2: new â€” conversation memory for the Groq fallback path only.
+# PHASE 2: new — conversation memory for the Groq fallback path only.
 # Every incoming/outgoing message logs here; get_recent_conversation() pulls
 # the last few turns for this customer so Groq can see context like
 # "you said the price was X earlier".
@@ -130,7 +130,7 @@ def log_message(customer_id, direction, text):
 def get_recent_conversation(customer_id, limit=6):
     """Returns the last `limit` messages for this customer, oldest first,
     formatted for dropping straight into the Groq prompt. Empty list if
-    there's no history or the DB is unreachable â€” Groq just gets no extra
+    there's no history or the DB is unreachable — Groq just gets no extra
     context in that case, same as today's behavior."""
     if not customer_id:
         return []
@@ -158,44 +158,44 @@ def get_recent_conversation(customer_id, limit=6):
         conn.close()
 
 
-# â”€â”€ Cache for common greetings â€” no Groq tokens used â”€â”€
+# ── Cache for common greetings — no Groq tokens used ──
 QUICK_REPLIES = {
-    "hi":        "Vanakkam! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for today?",
-    "hii":       "Vanakkam! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for today?",
-    "hiii":      "Vanakkam! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for today?",
-    "hello":     "Hello! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nHow can I help you?",
-    "hey":       "Hey! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for?",
-    "heyy":      "Hey! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for?",
-    "vanakkam":  "Vanakkam! Invi Creation-la vanga ðŸ‘— Pure cotton kurthi, kurthi sets, salwar sets. Rs.725 mudhal. Enna vennum?",
-    "hai":       "Vanakkam! Welcome to Invi Creation ðŸ‘— Pure cotton kurthi & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for?",
-    "ok":        "Sure! Tell me what you are looking for â€” kurthi, kurthi set, or salwar set? I will show you the best options ðŸ˜Š",
-    "okay":      "Sure! Tell me what you are looking for â€” kurthi, kurthi set, or salwar set? I will show you the best options ðŸ˜Š",
-    "thanks":    "Thank you for contacting Invi Creation ðŸ˜Š Feel free to message anytime!",
-    "thank you": "Thank you for contacting Invi Creation ðŸ˜Š Feel free to message anytime!",
-    "bye":       "Thank you for visiting Invi Creation ðŸ˜Š Come back anytime! Have a great day!",
+    "hi":        "Vanakkam! Welcome to Invi Creation 👗 Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for today?",
+    "hii":       "Vanakkam! Welcome to Invi Creation 👗 Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for today?",
+    "hiii":      "Vanakkam! Welcome to Invi Creation 👗 Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for today?",
+    "hello":     "Hello! Welcome to Invi Creation 👗 Pure cotton kurthi, kurthi sets & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nHow can I help you?",
+    "hey":       "Hey! Welcome to Invi Creation 👗 Pure cotton kurthi & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for?",
+    "heyy":      "Hey! Welcome to Invi Creation 👗 Pure cotton kurthi & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for?",
+    "vanakkam":  "Vanakkam! Invi Creation-la vanga 👗 Pure cotton kurthi, kurthi sets, salwar sets. Rs.725 mudhal. Enna vennum?",
+    "hai":       "Vanakkam! Welcome to Invi Creation 👗 Pure cotton kurthi & salwar sets. Rs.725-1899. Sizes XS-5XL.\n\nWhat are you looking for?",
+    "ok":        "Sure! Tell me what you are looking for — kurthi, kurthi set, or salwar set? I will show you the best options 😊",
+    "okay":      "Sure! Tell me what you are looking for — kurthi, kurthi set, or salwar set? I will show you the best options 😊",
+    "thanks":    "Thank you for contacting Invi Creation 😊 Feel free to message anytime!",
+    "thank you": "Thank you for contacting Invi Creation 😊 Feel free to message anytime!",
+    "bye":       "Thank you for visiting Invi Creation 😊 Come back anytime! Have a great day!",
 }
 
-# â”€â”€ Company details â”€â”€
+# ── Company details ──
 COMPANY_KEYWORDS = [
     "company", "address", "location", "where are you", "contact",
     "phone", "email", "website", "about", "shop", "store",
     "kadai", "enge irukeenga", "details", "info", "office"
 ]
 
-COMPANY_REPLY = """ðŸª *Invi Creation*
+COMPANY_REPLY = """🏪 *Invi Creation*
 
-ðŸŒ Website: https://www.invicreation.com
-ðŸ“ž Phone: 9751100905
-ðŸ“§ Email: invi0905@gmail.com
+🌐 Website: https://www.invicreation.com
+📞 Phone: 9751100905
+📧 Email: invi0905@gmail.com
 
-ðŸ“ Address:
+📍 Address:
 144, Vellakkal Medu, Post,
 Near Manjal Vaniga Valagam, Nasiyanur,
 Near Standard Roofs,
 Erode - 638107, Tamil Nadu, India
 
-ðŸ• Feel free to visit us or order online!
-For orders, just tell us the product SKU and your size ðŸ˜Š"""
+🕐 Feel free to visit us or order online!
+For orders, just tell us the product SKU and your size 😊"""
 
 
 def load_products():
@@ -247,7 +247,7 @@ Status: {'Available' if in_stock else 'Out of Stock'}"""
 
 
 def find_product_by_sku(sku, products):
-    """Find product by SKU â€” checks both SKU: field and All SKUs: field"""
+    """Find product by SKU — checks both SKU: field and All SKUs: field"""
     sku_upper = sku.upper().strip()
     for p in products:
         text = p["text"].upper()
@@ -285,18 +285,18 @@ def build_product_reply(details):
     if not handle:
         handle = sku.lower().replace(" ", "-") if sku else ""
     product_link = f"https://www.invicreation.com/products/{handle}" if handle else "https://www.invicreation.com"
-    reply = f"""ðŸ‘— *{name}*
+    reply = f"""👗 *{name}*
      
-ðŸ·ï¸ SKU: {sku}
-ðŸ’° Price: {price}
-ðŸ§µ Fabric: {fabric}
-ðŸ“ Sizes: {sizes.upper()}
-ðŸ‘š Sleeve: {sleeve}
-ðŸ‘” Neckline: {neckline}
-âœ… Status: {status}
-ðŸ”— View & Order: {product_link}
+🏷️ SKU: {sku}
+💰 Price: {price}
+🧵 Fabric: {fabric}
+📏 Sizes: {sizes.upper()}
+👚 Sleeve: {sleeve}
+👔 Neckline: {neckline}
+✅ Status: {status}
+🔗 View & Order: {product_link}
 
-To order, reply with your *size* and we will process it! ðŸ˜Š"""
+To order, reply with your *size* and we will process it! 😊"""
 
     return reply, image if image else None
 
@@ -308,10 +308,10 @@ def search(query, products, top_k=3):
         score = len(query_words.intersection(doc_words))
         scores.append((score, p["text"]))
     scores.sort(reverse=True)
-    # Only keep genuine matches â€” zero-overlap "matches" are noise that
+    # Only keep genuine matches — zero-overlap "matches" are noise that
     # confuses Groq into mixing unrelated products with real history
     return [text for score, text in scores[:top_k] if score > 0]
-# PHASE 1: semantic fallback â€” only used when the plain keyword search()
+# PHASE 1: semantic fallback — only used when the plain keyword search()
 # above finds zero matches. This catches synonym-style queries ("crimson
 # kurthi" finding "Crimson Bloom Cotton Kurthi") that keyword overlap
 # alone would miss, without changing behavior for anything that already
@@ -378,9 +378,9 @@ POLICY_KEYWORDS = [
     "how long", "when will i get", "dry clean", "wash", "care instructions",
 ]
 def extract_prices(text):
-    """PHASE 6: pulls out price-like values (Rs.789, â‚¹5,000, etc.) from
+    """PHASE 6: pulls out price-like values (Rs.789, ₹5,000, etc.) from
     text, normalized to plain numbers for comparison."""
-    matches = re.findall(r'(?:Rs\.?|â‚¹)\s?([\d,]+(?:\.\d+)?)', text, re.IGNORECASE)
+    matches = re.findall(r'(?:Rs\.?|₹)\s?([\d,]+(?:\.\d+)?)', text, re.IGNORECASE)
     prices = set()
     for m in matches:
         try:
@@ -393,7 +393,7 @@ AVAILABILITY_NEGATIVE_WORDS = ["out of stock", "unavailable", "sold out", "not a
 
 def check_stock_claims(reply, products):
     """PHASE 6: finds any SKU mentioned in Groq's reply, looks up its real
-    status, and checks whether the reply's wording contradicts it â€” e.g.
+    status, and checks whether the reply's wording contradicts it — e.g.
     claiming something is available when the real data says Out of Stock."""
     reply_lower = reply.lower()
     sku_matches = re.findall(r'\b(ICK\d+|ICS\d+|ICC\d+)\b', reply, re.IGNORECASE)
@@ -413,9 +413,9 @@ def check_stock_claims(reply, products):
 
 def validate_reply(reply, context, policy_context=None, products=None):
     """PHASE 6: checks Groq's reply against real data before it's sent.
-    Two independent checks â€” either can trigger the safe fallback."""
+    Two independent checks — either can trigger the safe fallback."""
     if products and not check_stock_claims(reply, products):
-        return False, "Let me confirm current availability for you and get right back to you! ðŸ˜Š"
+        return False, "Let me confirm current availability for you and get right back to you! 😊"
 
     reply_prices = extract_prices(reply)
     if not reply_prices:
@@ -424,13 +424,13 @@ def validate_reply(reply, context, policy_context=None, products=None):
     context_prices = extract_prices(context_text)
     unverified = [p for p in reply_prices if p not in context_prices]
     if unverified:
-        print(f"[PHASE6] Unverified price(s) in reply: {unverified} â€” using safe fallback")
-        return False, "Let me double-check that price for you and get right back to you! In the meantime, feel free to browse our collection at https://www.invicreation.com ðŸ˜Š"
+        print(f"[PHASE6] Unverified price(s) in reply: {unverified} — using safe fallback")
+        return False, "Let me double-check that price for you and get right back to you! In the meantime, feel free to browse our collection at https://www.invicreation.com 😊"
     return True, reply
 
 def search_policy_faq(message, limit=2):
     """PHASE 5: simple keyword search against the FAQ/policy knowledge base
-    (built in Phase 1). No embeddings, no extra API calls â€” just a plain
+    (built in Phase 1). No embeddings, no extra API calls — just a plain
     database search, matching this bot's existing style of preferring
     simple rules over AI where possible."""
     msg_lower = message.lower()
@@ -568,9 +568,9 @@ def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer
         log_customer_interest(customer_id, details.get("SKU", ""), details.get("Product", ""), matched_category)
 
     if not picked:
-        return "Sorry, I couldn't find matching products right now. You can browse our full collection at https://www.invicreation.com ðŸ˜Š", None, []
+        return "Sorry, I couldn't find matching products right now. You can browse our full collection at https://www.invicreation.com 😊", None, []
 
-    lines = ["Sure! Here are some lovely options for you ðŸ’ƒ:\n"]
+    lines = ["Sure! Here are some lovely options for you 💃:\n"]
     images = []
     for i, details in enumerate(picked, 1):
         name = details.get("Product", "").split("-PI")[0].strip()
@@ -579,19 +579,19 @@ def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer
         sizes = details.get("Available Sizes", "")
         handle = details.get("Handle", "")
         link = f"https://www.invicreation.com/products/{handle}" if handle else "https://www.invicreation.com"
-        lines.append(f"{i}. ðŸ‘— *{name}*\nðŸ·ï¸ SKU: {sku}\nðŸ’° Price: {price}\nðŸ“ Sizes: {sizes.upper()}\nðŸ”— View & Order: {link}\n")
+        lines.append(f"{i}. 👗 *{name}*\n🏷️ SKU: {sku}\n💰 Price: {price}\n📏 Sizes: {sizes.upper()}\n🔗 View & Order: {link}\n")
         images.append({"sku": sku, "name": name, "image": details.get("Image", "")})
 
-    lines.append("Reply with the SKU and your size to order! ðŸ˜Š")
+    lines.append("Reply with the SKU and your size to order! 😊")
     reply_text = "\n".join(lines)
     return reply_text, images[0]["image"] if images else None, images
 def build_collection_overview_reply(products):
     """Warm intro + one representative product per category"""
-    intro = ("Hi! ðŸ‘‹ Welcome to *Invi Creation* â€” your go-to boutique for pure cotton women's wear.\n\n"
+    intro = ("Hi! 👋 Welcome to *Invi Creation* — your go-to boutique for pure cotton women's wear.\n\n"
               "Here's what we have:\n"
-              "ðŸ‘— Kurthis\n"
-              "ðŸ¥» Salwar Suit Sets\n"
-              "ðŸ‘˜ Maxi Dresses\n\n"
+              "👗 Kurthis\n"
+              "🥻 Salwar Suit Sets\n"
+              "👘 Maxi Dresses\n\n"
               "Here's a peek at each category:\n")
     categories = [
         ("kurthi", ["kurthi", "kurta", "kurti"]),
@@ -621,9 +621,9 @@ def build_collection_overview_reply(products):
             sizes = best.get("Available Sizes", "")
             handle = best.get("Handle", "")
             link = f"https://www.invicreation.com/products/{handle}" if handle else "https://www.invicreation.com"
-            lines.append(f"{count}. ðŸ‘— *{name}*\nðŸ·ï¸ SKU: {sku}\nðŸ’° Price: {price}\nðŸ“ Sizes: {sizes.upper()}\nðŸ”— View & Order: {link}\n")
+            lines.append(f"{count}. 👗 *{name}*\n🏷️ SKU: {sku}\n💰 Price: {price}\n📏 Sizes: {sizes.upper()}\n🔗 View & Order: {link}\n")
             images.append({"sku": sku, "name": name, "image": best.get("Image", "")})
-    lines.append("Reply with the SKU and your size to order, or tell me what you're looking for! ðŸ˜Š")
+    lines.append("Reply with the SKU and your size to order, or tell me what you're looking for! 😊")
     reply_text = "\n".join(lines)
     return reply_text, images[0]["image"] if images else None, images
 
@@ -661,23 +661,23 @@ Customer Message: {query}
 Instructions:
 - Reply friendly and short like a boutique staff on WhatsApp
 - If customer says hi or hello, greet them and introduce Invi Creation
-- If the recent conversation above answers part of the question (e.g. a price or product already mentioned), use it exactly as stated there â€” don't substitute a different product from "Relevant Products" below, even if it seems similar
-- If customer asks to suggest, show, or recommend dresses â€” show 5 products like this format EXACTLY:
+- If the recent conversation above answers part of the question (e.g. a price or product already mentioned), use it exactly as stated there — don't substitute a different product from "Relevant Products" below, even if it seems similar
+- If customer asks to suggest, show, or recommend dresses — show 5 products like this format EXACTLY:
 
-1. ðŸ‘— *Product Name*
-ðŸ·ï¸ SKU: ICK00XXX
-ðŸ’° Price: Rs.XXX
-ðŸ“ Sizes: XS to 5XL
-ðŸ”— View & Order: https://www.invicreation.com/products/[handle]
+1. 👗 *Product Name*
+🏷️ SKU: ICK00XXX
+💰 Price: Rs.XXX
+📏 Sizes: XS to 5XL
+🔗 View & Order: https://www.invicreation.com/products/[handle]
 
-2. ðŸ‘— *Product Name*
+2. 👗 *Product Name*
 ...and so on for 5 products
 
 - If customer gives a SKU like ICK00133, show ONLY that product details
 - Always use the exact Handle from product data for the View & Order link
 - Never make up products not in the context
 - Reply in same language as customer (Tamil or English)
-- End with: Reply with the SKU and your size to order! ðŸ˜Š
+- End with: Reply with the SKU and your size to order! 😊
 
 Answer:"""
 
@@ -706,14 +706,14 @@ def ai_reply():
     if not message:
         return jsonify({"reply": "", "image": None, "type": "text"})
 
-    # PHASE 2: log every incoming message. This is a plain append â€” it never
+    # PHASE 2: log every incoming message. This is a plain append — it never
     # affects which branch below runs, so quick replies/SKU/suggestions all
     # behave exactly as before.
     log_message(customer_id, "incoming", message)
 
     msg_lower = message.lower().strip()
 
-    # â”€â”€ 1. Greeting cache â€” no Groq call â”€â”€
+    # ── 1. Greeting cache — no Groq call ──
     if msg_lower in QUICK_REPLIES:
         print(f"[CACHE] {message}")
         reply_text = QUICK_REPLIES[msg_lower]
@@ -724,7 +724,7 @@ def ai_reply():
             "type": "text"
         })
 
-    # â”€â”€ 2. Company details â”€â”€
+    # ── 2. Company details ──
     if any(kw in msg_lower for kw in COMPANY_KEYWORDS):
         print(f"[COMPANY] {message}")
         log_message(customer_id, "outgoing", COMPANY_REPLY)  # PHASE 2
@@ -734,7 +734,7 @@ def ai_reply():
             "type": "text"
         })
 
-    # â”€â”€ 3. SKU detection â€” send image + details â”€â”€
+    # ── 3. SKU detection — send image + details ──
     sku_match = re.search(r'\b(ICK\d+|ICS\d+|ICC\d+)\b', message, re.IGNORECASE)
     if sku_match:
         sku = sku_match.group(1).upper()
@@ -743,7 +743,7 @@ def ai_reply():
         if product:
             details = parse_product_details(product)
             reply, image_url = build_product_reply(details)
-            print(f"[SKU] {sku} â†’ {details.get('Product', '')}")
+            print(f"[SKU] {sku} → {details.get('Product', '')}")
             log_message(customer_id, "outgoing", reply)  # PHASE 2
             return jsonify({
                 "reply": reply,
@@ -751,7 +751,7 @@ def ai_reply():
                 "type": "product"
             })
         else:
-            not_found_reply = f"Sorry, I could not find product *{sku}*. Please check the SKU and try again. You can browse our collection at https://www.invicreation.com ðŸ˜Š"
+            not_found_reply = f"Sorry, I could not find product *{sku}*. Please check the SKU and try again. You can browse our collection at https://www.invicreation.com 😊"
             log_message(customer_id, "outgoing", not_found_reply)  # PHASE 2
             return jsonify({
                 "reply": not_found_reply,
@@ -761,7 +761,7 @@ def ai_reply():
        
     products = load_products()
 
-    # â”€â”€ 4a. "What collection do you have" â€” warm intro + one item per category â”€â”€
+    # ── 4a. "What collection do you have" — warm intro + one item per category ──
     collection_overview_keywords = ["what collection", "collections do you have", "what do you have",
                                      "what all", "what products", "what items", "categories"]
     if any(kw in msg_lower for kw in collection_overview_keywords):
@@ -775,7 +775,7 @@ def ai_reply():
             "type": "product" if top_image else "text"
         })
 
-    # â”€â”€ 4b. Dress/collection suggestion â€” build directly from real data, no Groq â”€â”€
+    # ── 4b. Dress/collection suggestion — build directly from real data, no Groq ──
     suggest_keywords = ["suggest", "show me", "recommend", "options", "collection"] + DRESS_KEYWORDS
     has_policy_question = any(kw in msg_lower for kw in POLICY_KEYWORDS)  # PHASE 5
     if any(kw in msg_lower for kw in suggest_keywords) and not has_policy_question:  # PHASE 5: fall through to Groq if a policy question is also present
@@ -831,12 +831,12 @@ def detect_category(text):
 INTEREST_TEMPLATE_ID = os.environ.get("INTEREST_TEMPLATE_ID")  # set once Meta approves the template
 
 def prepare_followup_for_interest(interest_id, customer_number, category, color, sku, product_name, product_handle):
-    """PHASE 3: creates a DRAFT broadcast for manual review â€” never sends
-    automatically. Marks the interest 'match_found' (NOT 'contacted' â€”
+    """PHASE 3: creates a DRAFT broadcast for manual review — never sends
+    automatically. Marks the interest 'match_found' (NOT 'contacted' —
     that only happens once a human actually clicks Send in the real
     Broadcast UI, which is outside this bot's control entirely)."""
     if not INTEREST_TEMPLATE_ID:
-        print("[PHASE3] INTEREST_TEMPLATE_ID not set yet â€” skipping, template pending Meta approval")
+        print("[PHASE3] INTEREST_TEMPLATE_ID not set yet — skipping, template pending Meta approval")
         return
 
     product_link = f"https://www.invicreation.com/products/{product_handle}" if product_handle else "https://www.invicreation.com"
@@ -851,7 +851,7 @@ def prepare_followup_for_interest(interest_id, customer_number, category, color,
             json={
                 "customer_number": customer_number,
                 "template_id": int(INTEREST_TEMPLATE_ID),
-                "name": f"Interest follow-up: {customer_number} â€” {color} {category}",
+                "name": f"Interest follow-up: {customer_number} — {color} {category}",
                 "variable_mapping": variable_mapping,
             },
             timeout=10,
@@ -866,7 +866,7 @@ def prepare_followup_for_interest(interest_id, customer_number, category, color,
                             ("match_found", sku, interest_id),
                         )
                     conn.commit()
-                    print(f"[PHASE3] Draft ready for review: {customer_number} â€” {sku}")
+                    print(f"[PHASE3] Draft ready for review: {customer_number} — {sku}")
                 finally:
                     conn.close()
         else:
