@@ -696,6 +696,107 @@ Answer:"""
         print("GROQ ERROR RESPONSE:", result)
         return "Sorry, I'm having trouble right now. Please try again in a moment."
     return result['choices'][0]['message']['content']
+# ── Customer Intent / Lead Intelligence ──────────────────────────────────
+# Ordered highest-signal to lowest — first match wins, so "how to order"
+# is caught before it could ever be treated as generic browsing.
+INTENT_SIGNAL_TIERS = [
+    ("SUPPORT", ["complaint", "problem", "issue", "damaged", "wrong item",
+                 "not working", "refund", "exchange", "return"], None),
+    ("EXISTING_CUSTOMER", ["order status", "where is my order", "tracking",
+                            "delivery status", "my order", "track my order"], None),
+    ("PURCHASE_INTENT", ["how to order", "want this", "want to buy",
+                          "i want", "book this", "confirm order", "place order"], 90),
+    ("HOT_LEAD", ["cod", "cash on delivery", "delivery", "deliver",
+                  "available", "in stock", "size", "color"], 65),
+    ("WARM_LEAD", ["price", "cost", "how much", "rate"], 50),
+    ("PRODUCT_INTEREST", ["like this", "similar", "design", "vera",
+                           "maari", "designs"], 30),
+]
+
+def classify_intent(message):
+    """Rule-based message-level intent classification — same simple-rules
+    style as POLICY_KEYWORDS/CATEGORY_WORDS_MATCH elsewhere in this file."""
+    msg_lower = message.lower()
+    for intent, keywords, score in INTENT_SIGNAL_TIERS:
+        if any(kw in msg_lower for kw in keywords):
+            return intent, score, 0.8
+    return "JUST_BROWSING", 10, 0.5
+
+
+def score_to_label(score):
+    if score >= 85:
+        return "PURCHASE_INTENT"
+    if score >= 65:
+        return "HOT_LEAD"
+    if score >= 40:
+        return "WARM_LEAD"
+    if score >= 20:
+        return "PRODUCT_INTEREST"
+    return "JUST_BROWSING"
+
+
+def update_customer_score(wa_number, contact_number, message, detected_intent, signal_score, confidence):
+    """Blends this message's signal with the customer's existing score, so
+    one message doesn't wildly swing their classification, while repeated
+    behavior still shifts them Cold -> Warm -> Hot over time."""
+    conn = get_db_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT current_intent, buying_score
+                FROM coexistence.customer_intent_profiles
+                WHERE workspace_id = %s AND wa_number = %s AND contact_number = %s
+                """,
+                (1, wa_number, contact_number),
+            )
+            row = cur.fetchone()
+            old_intent = row[0] if row else "JUST_BROWSING"
+            old_score = row[1] if row else 0
+
+            if detected_intent in ("SUPPORT", "EXISTING_CUSTOMER"):
+                new_score = old_score
+                new_intent = detected_intent
+            else:
+                effective_signal = signal_score if signal_score is not None else 10
+                new_score = max(0, min(100, round(0.6 * effective_signal + 0.4 * old_score)))
+                new_intent = score_to_label(new_score)
+
+            cur.execute(
+                """
+                INSERT INTO coexistence.customer_intent_profiles
+                    (workspace_id, wa_number, contact_number, current_intent,
+                     buying_score, intent_confidence, last_activity, last_intent_update)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (workspace_id, wa_number, contact_number) DO UPDATE SET
+                    current_intent = EXCLUDED.current_intent,
+                    buying_score = EXCLUDED.buying_score,
+                    intent_confidence = EXCLUDED.intent_confidence,
+                    last_activity = NOW(),
+                    last_intent_update = NOW(),
+                    updated_at = NOW()
+                """,
+                (1, wa_number, contact_number, new_intent, new_score, confidence),
+            )
+
+            if new_intent != old_intent or new_score != old_score:
+                cur.execute(
+                    """
+                    INSERT INTO coexistence.customer_intent_history
+                        (workspace_id, wa_number, contact_number, previous_intent,
+                         new_intent, previous_score, new_score, trigger_message)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (1, wa_number, contact_number, old_intent, new_intent, old_score, new_score, message[:500]),
+                )
+        conn.commit()
+    except Exception as e:
+        print(f"[INTENT] update_customer_score failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
 
 @app.route("/ai", methods=["POST"])
@@ -703,6 +804,7 @@ def ai_reply():
     data = request.json
     message = data.get("message", "").strip()
     customer_id = data.get("customer_id", "")
+    wa_number = data.get("wa_number", "")
     if not message:
         return jsonify({"reply": "", "image": None, "type": "text"})
 
@@ -710,6 +812,9 @@ def ai_reply():
     # affects which branch below runs, so quick replies/SKU/suggestions all
     # behave exactly as before.
     log_message(customer_id, "incoming", message)
+
+    detected_intent, signal_score, confidence = classify_intent(message)
+    update_customer_score(wa_number, customer_id, message, detected_intent, signal_score, confidence)
 
     msg_lower = message.lower().strip()
 
