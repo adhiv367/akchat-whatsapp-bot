@@ -815,7 +815,7 @@ def ai_reply():
 
     detected_intent, signal_score, confidence = classify_intent(message)
     update_customer_score(wa_number, customer_id, message, detected_intent, signal_score, confidence)
-
+    print(f"[INTENT] {customer_id}: {detected_intent} (signal={signal_score}, wa_number={wa_number})")
     msg_lower = message.lower().strip()
 
     # ── 1. Greeting cache — no Groq call ──
