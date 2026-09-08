@@ -351,7 +351,7 @@ def embed_text(text):
     truncated = full_vector[:1536]
     norm = sum(v * v for v in truncated) ** 0.5
     return [v / norm for v in truncated] if norm > 0 else truncated
-    SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
+SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 
 def lookup_order_by_phone(phone_number):
