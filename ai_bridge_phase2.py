@@ -351,6 +351,44 @@ def embed_text(text):
     truncated = full_vector[:1536]
     norm = sum(v * v for v in truncated) ** 0.5
     return [v / norm for v in truncated] if norm > 0 else truncated
+    SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
+SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
+
+def lookup_order_by_phone(phone_number):
+    """PHASE 4: looks up the customer's most recent order(s) on Shopify by
+    phone number. Returns a list of order summary dicts, or [] if none
+    found / on any error (fails quiet, same pattern as other DB helpers)."""
+    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
+        print("[PHASE4] Shopify credentials not configured")
+        return []
+    try:
+        # Normalize to a bare digit string for the search query
+        digits = re.sub(r'\D', '', phone_number)
+        headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
+        url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
+        params = {
+            "status": "any",
+            "phone": f"+{digits}" if not digits.startswith('+') else digits,
+            "limit": 3,
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"[PHASE4] Shopify order lookup failed: {resp.status_code} {resp.text[:200]}")
+            return []
+        orders = resp.json().get("orders", [])
+        results = []
+        for o in orders:
+            results.append({
+                "order_number": o.get("order_number") or o.get("name"),
+                "financial_status": o.get("financial_status"),
+                "fulfillment_status": o.get("fulfillment_status") or "unfulfilled",
+                "total_price": o.get("total_price"),
+                "created_at": o.get("created_at"),
+            })
+        return results
+    except Exception as e:
+        print(f"[PHASE4] lookup_order_by_phone error: {e}")
+        return []
 def embed_product_chunk(handle, sku, text):
     """PHASE 1 (webhook auto-embed): mirrors sync_products_to_pg.py's logic
     for a single product, so new/updated Shopify products become
@@ -422,6 +460,28 @@ DRESS_KEYWORDS = ["dress", "dresses", "kurthi", "kurthis", "salwar", "outfit", "
 # PHASE 5: policy/FAQ keywords for detecting a second intent alongside a
 # product question (e.g. "is it available AND can I get delivery by Friday")
 POLICY_KEYWORDS = [
+    
+ORDER_STATUS_KEYWORDS = [
+    "where is my order", "where's my order", "order status", "track my order",
+    "tracking", "my order", "order update", "has my order shipped",
+    "when will my order arrive",
+]
+
+def build_order_status_reply(orders):
+    """PHASE 4: formats Shopify order results into a WhatsApp-friendly reply."""
+    if not orders:
+        return ("I couldn't find a recent order linked to this number. "
+                "Could you share your order number so I can check for you? 😊")
+    lines = ["Here's what I found for your recent order(s):\n"]
+    for o in orders:
+        status = o["fulfillment_status"].replace("_", " ").title()
+        lines.append(
+            f"🧾 Order #{o['order_number']}\n"
+            f"💰 Total: Rs.{o['total_price']}\n"
+            f"📦 Status: {status}\n"
+        )
+    lines.append("Let me know if you need anything else! 😊")
+    return "\n".join(lines)
     "delivery", "deliver", "ship", "shipping", "return", "refund", "exchange",
     "cash on delivery", "cod", "payment", "pay by", "store hours", "store timing",
     "how long", "when will i get", "dry clean", "wash", "care instructions",
@@ -927,6 +987,17 @@ def ai_reply():
             "image": top_image,
             "images": image_list,
             "type": "product" if top_image else "text"
+        })
+    # ── 4a-2. Order status — look up real Shopify order, no Groq ──
+    if any(kw in msg_lower for kw in ORDER_STATUS_KEYWORDS):
+        orders = lookup_order_by_phone(customer_id)
+        reply = build_order_status_reply(orders)
+        print(f"[PHASE4] Order status lookup for {customer_id} -> {len(orders)} order(s) found")
+        log_message(customer_id, "outgoing", reply)  # PHASE 2
+        return jsonify({
+            "reply": reply,
+            "image": None,
+            "type": "text"
         })
 
     # ── 4b. Dress/collection suggestion — build directly from real data, no Groq ──
