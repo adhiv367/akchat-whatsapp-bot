@@ -1034,7 +1034,7 @@ def ai_reply():
             "type": "product" if top_image else "text"
         })
     # ── 4a-2. Order status — look up real Shopify order, no Groq ──
-    order_number = extract_order_number(msg)
+    order_number = extract_order_number(message)
     if order_number:
         orders = lookup_order_by_number(order_number)
         reply = build_order_status_reply(orders)
@@ -1044,7 +1044,7 @@ def ai_reply():
     elif was_just_asked_for_order_number(customer_id):
         # Bare reply after we asked for an order number, but extract_order_number found nothing usable
         reply = "I couldn't find an order matching that number — could you double check and resend just the order number (e.g. 2112)?"
-        print(f"[PHASE4] Order-number follow-up expected for {customer_id} but no valid number extracted from: {msg}")
+        print(f"[PHASE4] Order-number follow-up expected for {customer_id} but no valid number extracted from: {message}")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
     elif any(kw in msg_lower for kw in ORDER_STATUS_KEYWORDS):
