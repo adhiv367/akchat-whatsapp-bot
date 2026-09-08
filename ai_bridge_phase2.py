@@ -359,7 +359,6 @@ def lookup_order_by_phone(phone_number):
     phone number. Returns a list of order summary dicts, or [] if none
     found / on any error (fails quiet, same pattern as other DB helpers)."""
     if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
-        print("[PHASE4] Shopify credentials not configured")
         return []
     try:
         # Normalize to a bare digit string for the search query
@@ -477,8 +476,6 @@ def lookup_order_by_number(order_number):
         url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
         params = {"status": "any", "name": f"#{clean_number}"}
         resp = requests.get(url, headers=headers, params=params, timeout=10)
-        print(f"[PHASE4-DEBUG] URL={url} params={params}")
-        print(f"[PHASE4-DEBUG] status={resp.status_code}")
         if resp.status_code != 200:
             print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
             return []
