@@ -373,7 +373,7 @@ def lookup_order_by_phone(phone_number):
         }
         resp = requests.get(url, headers=headers, params=params, timeout=10)
         if resp.status_code != 200:
-            print(f"[PHASE4] Shopify order lookup failed: {resp.status_code} {resp.text[:200]}")
+            print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
             return []
         orders = resp.json().get("orders", [])
         results = []
@@ -476,10 +476,13 @@ def lookup_order_by_number(order_number):
         url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
         params = {"status": "any", "name": f"#{clean_number}"}
         resp = requests.get(url, headers=headers, params=params, timeout=10)
+        print(f"[PHASE4-DEBUG] URL={url} params={params}")
+        print(f"[PHASE4-DEBUG] status={resp.status_code}")
         if resp.status_code != 200:
             print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
             return []
         orders = resp.json().get("orders", [])
+        print(f"[PHASE4-DEBUG] orders_returned={len(orders)} names={[o.get('name') for o in orders]}")
         return [{
             "order_number": o.get("order_number") or o.get("name"),
             "financial_status": o.get("financial_status"),
