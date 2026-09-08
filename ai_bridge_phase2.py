@@ -464,6 +464,51 @@ POLICY_KEYWORDS = [
     "cash on delivery", "cod", "payment", "pay by", "store hours", "store timing",
     "how long", "when will i get", "dry clean", "wash", "care instructions",
 ]
+def lookup_order_by_number(order_number):
+    """PHASE 4: looks up a single Shopify order by its order number/name
+    (e.g. '2112' or '#2112'). Returns a list with 0 or 1 order dict,
+    same shape as lookup_order_by_phone, for a consistent reply format."""
+    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
+        return []
+    try:
+        clean_number = order_number.lstrip('#').strip()
+        headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
+        url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
+        params = {"status": "any", "name": f"#{clean_number}"}
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
+            return []
+        orders = resp.json().get("orders", [])
+        return [{
+            "order_number": o.get("order_number") or o.get("name"),
+            "financial_status": o.get("financial_status"),
+            "fulfillment_status": o.get("fulfillment_status") or "unfulfilled",
+            "total_price": o.get("total_price"),
+            "created_at": o.get("created_at"),
+        } for o in orders]
+    except Exception as e:
+        print(f"[PHASE4] lookup_order_by_number error: {e}")
+        return []
+
+
+def extract_order_number(text):
+    """PHASE 4: pulls a likely order number out of free text, e.g.
+    'order id 2122', '#2112', 'my order 2112 what happened'. Deliberately
+    narrow (3-5 digits) to avoid matching 10-digit phone numbers."""
+    match = re.search(r'#?\b(\d{3,5})\b', text)
+    return match.group(1) if match else None
+
+
+def was_just_asked_for_order_number(customer_id):
+    """PHASE 4: checks if our last outgoing message to this customer was
+    the 'share your order number' fallback, so a bare number reply right
+    after it gets treated as an order number even without other keywords."""
+    history = get_recent_conversation(customer_id, limit=2)
+    for direction, text in reversed(history):
+        if direction == "outgoing":
+            return "share your order number" in text.lower()
+    return False
     
 ORDER_STATUS_KEYWORDS = [
     "where is my order", "where's my order", "order status", "track my order",
@@ -989,16 +1034,25 @@ def ai_reply():
             "type": "product" if top_image else "text"
         })
     # ── 4a-2. Order status — look up real Shopify order, no Groq ──
-    if any(kw in msg_lower for kw in ORDER_STATUS_KEYWORDS):
+    order_number = extract_order_number(msg)
+    if order_number:
+        orders = lookup_order_by_number(order_number)
+        reply = build_order_status_reply(orders)
+        print(f"[PHASE4] Order number lookup for {customer_id} (#{order_number}) -> {len(orders)} order(s) found")
+        log_message(customer_id, "outgoing", reply)
+        return jsonify({"reply": reply, "image": None, "type": "text"})
+    elif was_just_asked_for_order_number(customer_id):
+        # Bare reply after we asked for an order number, but extract_order_number found nothing usable
+        reply = "I couldn't find an order matching that number — could you double check and resend just the order number (e.g. 2112)?"
+        print(f"[PHASE4] Order-number follow-up expected for {customer_id} but no valid number extracted from: {msg}")
+        log_message(customer_id, "outgoing", reply)
+        return jsonify({"reply": reply, "image": None, "type": "text"})
+    elif any(kw in msg_lower for kw in ORDER_STATUS_KEYWORDS):
         orders = lookup_order_by_phone(customer_id)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Order status lookup for {customer_id} -> {len(orders)} order(s) found")
-        log_message(customer_id, "outgoing", reply)  # PHASE 2
-        return jsonify({
-            "reply": reply,
-            "image": None,
-            "type": "text"
-        })
+        log_message(customer_id, "outgoing", reply)
+        return jsonify({"reply": reply, "image": None, "type": "text"})
 
     # ── 4b. Dress/collection suggestion — build directly from real data, no Groq ──
     suggest_keywords = ["suggest", "show me", "recommend", "options", "collection"] + DRESS_KEYWORDS
