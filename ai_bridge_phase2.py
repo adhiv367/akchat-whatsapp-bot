@@ -341,53 +341,16 @@ def semantic_search_products(query, top_k=3):
     finally:
         conn.close()
 
-def embed_product_chunk(handle, sku, text):
-    """PHASE 1 (webhook auto-embed): mirrors sync_products_to_pg.py's logic
-    for a single product, so new/updated Shopify products become
-    semantically searchable immediately, without waiting for a manual
-    sync_products_to_pg.py re-run. Safe to call repeatedly for the same
-    product — deletes any existing embedded document for this handle
-    first, same re-run-safe pattern as the bulk sync script."""
-    conn = get_db_conn()
-    if not conn:
-        print("[PHASE1] embed_product_chunk skipped — no DB connection")
-        return
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM coexistence.knowledge_documents "
-                "WHERE workspace_id = %s AND source_type = 'product' "
-                "AND metadata->>'handle' = %s",
-                (1, handle),
-            )
-            title = sku or handle or "product"
-            cur.execute(
-                """
-                INSERT INTO coexistence.knowledge_documents
-                    (workspace_id, source_type, title, content, metadata)
-                VALUES (%s, 'product', %s, %s, %s)
-                RETURNING id
-                """,
-                (1, title, text, json.dumps({"handle": handle, "sku": sku})),
-            )
-            document_id = cur.fetchone()[0]
-            vector = embed_text(text)
-            vector_literal = "[" + ",".join(str(v) for v in vector) + "]"
-            cur.execute(
-                """
-                INSERT INTO coexistence.knowledge_chunks
-                    (document_id, workspace_id, chunk_text, embedding, token_count)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (document_id, 1, text, vector_literal, len(text) // 4),
-            )
-        conn.commit()
-        print(f"[PHASE1] Embedded product for semantic search: {title}")
-    except Exception as e:
-        print(f"[PHASE1] embed_product_chunk failed: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
+def embed_text(text):
+    """PHASE 1: embeds text using gemini-embedding-001 (3072 dims), then
+    truncates + re-normalizes to 1536 dims to match the knowledge_chunks
+    table's embedding column (a pgvector ivfflat index caps at 2000 dims,
+    so we can't just widen the column to fit the full 3072-dim output)."""
+    result = genai.embed_content(model="models/gemini-embedding-001", content=text)
+    full_vector = result["embedding"]
+    truncated = full_vector[:1536]
+    norm = sum(v * v for v in truncated) ** 0.5
+    return [v / norm for v in truncated] if norm > 0 else truncated
 def get_top_product_images(query, products, top_k=5):
     """Return list of matching products with sku, name, and image for suggestion replies"""
     query_words = set(query.lower().split())
