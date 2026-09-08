@@ -468,7 +468,6 @@ def lookup_order_by_number(order_number):
     (e.g. '2112' or '#2112'). Returns a list with 0 or 1 order dict,
     same shape as lookup_order_by_phone, for a consistent reply format."""
     if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
-        print(f"[PHASE4-DEBUG] Missing creds: domain_set={bool(SHOPIFY_STORE_DOMAIN)} token_set={bool(SHOPIFY_ACCESS_TOKEN)}")
         return []
     try:
         clean_number = order_number.lstrip('#').strip()
@@ -480,7 +479,6 @@ def lookup_order_by_number(order_number):
             print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
             return []
         orders = resp.json().get("orders", [])
-        print(f"[PHASE4-DEBUG] orders_returned={len(orders)} names={[o.get('name') for o in orders]}")
         return [{
             "order_number": o.get("order_number") or o.get("name"),
             "financial_status": o.get("financial_status"),
