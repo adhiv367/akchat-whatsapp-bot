@@ -1113,12 +1113,19 @@ def ai_reply():
         print(f"[PHASE4] Email lookup for {customer_id} -> {len(orders)} order(s) found")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
+    elif phone_in_msg:
+        # SECURITY: never look up by the typed digits themselves -- that would let
+        # anyone pull another customer's order by typing their phone number.
+        # A phone number in the message is only a signal this is an order-status
+        # request; lookup always uses the sender's own authenticated identity
+        # (customer_id), same as the keyword branch below.
+        orders = lookup_order_by_phone(customer_id)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Phone-in-message lookup for {customer_id} -> {len(orders)} order(s) found")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
     elif was_just_asked_for_order_number(customer_id):
-        reply = "I couldn't match that — could you resend just your order number, email, or mobile number?"
+        reply = "I couldn't match that -- could you resend just your order number, email, or mobile number?"
         print(f"[PHASE4] Follow-up expected for {customer_id} but nothing usable extracted from: {message}")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
