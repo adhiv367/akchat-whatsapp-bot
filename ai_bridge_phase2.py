@@ -470,13 +470,7 @@ def lookup_order_by_number(order_number):
             print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
             return []
         orders = resp.json().get("orders", [])
-        return [{
-            "order_number": o.get("order_number") or o.get("name"),
-            "financial_status": o.get("financial_status"),
-            "fulfillment_status": o.get("fulfillment_status") or "unfulfilled",
-            "total_price": o.get("total_price"),
-            "created_at": o.get("created_at"),
-        } for o in orders]
+        return [_summarize_order(o) for o in orders]
     except Exception as e:
         print(f"[PHASE4] lookup_order_by_number error: {e}")
         return []
