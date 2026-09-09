@@ -1094,6 +1094,8 @@ def ai_reply():
     order_number = extract_order_number(message)
     email = extract_email(message)
     phone_in_msg = re.search(r'\b\d{10}\b', re.sub(r'\D', ' ', message))
+    _debug_history = get_recent_conversation(customer_id, limit=2)
+    print(f"[PHASE4-DEBUG] order_number={order_number} email={email} phone_in_msg={phone_in_msg.group(0) if phone_in_msg else None} was_just_asked={was_just_asked_for_order_number(customer_id)} history={_debug_history}")
     if order_number:
         orders = lookup_order_by_number(order_number)
         reply = build_order_status_reply(orders)
