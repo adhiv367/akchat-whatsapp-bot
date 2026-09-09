@@ -356,29 +356,43 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 
 def lookup_order_by_phone(phone_number):
     """PHASE 4: looks up the customer's most recent order(s) on Shopify by
-    phone number. Returns a list of order summary dicts, or [] if none
-    found / on any error (fails quiet, same pattern as other DB helpers)."""
+    phone number. Two-step: find the customer via customers/search.json
+    (orders.json has no working phone filter), then fetch that customer's
+    orders directly. Returns [] if no matching customer / on any error."""
     if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
         return []
     try:
-        # Normalize to a bare digit string for the search query
         digits = re.sub(r'\D', '', phone_number)
         headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
-        url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
-        params = {
-            "status": "any",
-            "phone": f"+{digits}" if not digits.startswith('+') else digits,
-            "limit": 3,
-        }
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        if resp.status_code != 200:
-            print(f"[PHASE4] Shopify order-number lookup failed: {resp.status_code} {resp.text[:200]}")
+
+        search_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/customers/search.json"
+        search_resp = requests.get(
+            search_url, headers=headers,
+            params={"query": f"phone:*{digits}"}, timeout=10
+        )
+        if search_resp.status_code != 200:
+            print(f"[PHASE4] Shopify customer-search failed: {search_resp.status_code} {search_resp.text[:200]}")
             return []
-        orders = resp.json().get("orders", [])
+        customers = search_resp.json().get("customers", [])
+        if not customers:
+            print(f"[PHASE4] No Shopify customer found for phone digits={digits}")
+            return []
+        customer_id = customers[0]["id"]
+
+        orders_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/customers/{customer_id}/orders.json"
+        orders_resp = requests.get(
+            orders_url, headers=headers,
+            params={"status": "any", "limit": 3}, timeout=10
+        )
+        if orders_resp.status_code != 200:
+            print(f"[PHASE4] Shopify customer-orders lookup failed: {orders_resp.status_code} {orders_resp.text[:200]}")
+            return []
+        orders = orders_resp.json().get("orders", [])
         return [_summarize_order(o) for o in orders]
     except Exception as e:
         print(f"[PHASE4] lookup_order_by_phone error: {e}")
         return []
+
 def embed_product_chunk(handle, sku, text):
     """PHASE 1 (webhook auto-embed): mirrors sync_products_to_pg.py's logic
     for a single product, so new/updated Shopify products become
