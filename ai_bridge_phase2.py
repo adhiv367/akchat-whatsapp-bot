@@ -377,14 +377,8 @@ def lookup_order_by_phone(phone_number):
         orders = resp.json().get("orders", [])
         results = []
         for o in orders:
-            results.append({
-                "order_number": o.get("order_number") or o.get("name"),
-                "financial_status": o.get("financial_status"),
-                "fulfillment_status": o.get("fulfillment_status") or "unfulfilled",
-                "total_price": o.get("total_price"),
-                "created_at": o.get("created_at"),
-            })
-        return results
+           results = [_summarize_order(o) for o in orders]
+           return results
     except Exception as e:
         print(f"[PHASE4] lookup_order_by_phone error: {e}")
         return []
