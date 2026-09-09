@@ -1108,7 +1108,7 @@ def ai_reply():
         print(f"[PHASE4] Email lookup for {customer_id} -> {len(orders)} order(s) found")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
-    elif phone_in_msg and was_just_asked_for_order_number(customer_id):
+    elif phone_in_msg:
         orders = lookup_order_by_phone(phone_in_msg.group(0))
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Phone-in-message lookup for {customer_id} -> {len(orders)} order(s) found")
