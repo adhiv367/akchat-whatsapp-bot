@@ -368,7 +368,7 @@ def lookup_order_by_phone(phone_number):
         search_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/customers/search.json"
         search_resp = requests.get(
             search_url, headers=headers,
-            params={"query": f"phone:*{digits}"}, timeout=10
+            params={"query": digits}, timeout=10
         )
         if search_resp.status_code != 200:
             print(f"[PHASE4] Shopify customer-search failed: {search_resp.status_code} {search_resp.text[:200]}")
