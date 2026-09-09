@@ -489,6 +489,68 @@ def lookup_order_by_number(order_number):
     except Exception as e:
         print(f"[PHASE4] lookup_order_by_number error: {e}")
         return []
+def lookup_order_by_email(email):
+    """PHASE 4: looks up recent orders by customer email."""
+    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
+        return []
+    try:
+        headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
+        url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
+        params = {"status": "any", "email": email.strip(), "limit": 3}
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"[PHASE4] Shopify email lookup failed: {resp.status_code} {resp.text[:200]}")
+            return []
+        return [_summarize_order(o) for o in resp.json().get("orders", [])]
+    except Exception as e:
+        print(f"[PHASE4] lookup_order_by_email error: {e}")
+        return []
+def _summarize_order(o):
+    """PHASE 4: extracts order + delivery/product info from a raw Shopify
+    order object into the flat dict shape build_order_status_reply expects."""
+    fulfillments = o.get("fulfillments") or []
+    tracking_number = None
+    tracking_url = None
+    tracking_company = None
+    if fulfillments:
+        f = fulfillments[-1]
+        tracking_number = f.get("tracking_number")
+        tracking_url = (f.get("tracking_url")
+                         or (f.get("tracking_urls") or [None])[0])
+        tracking_company = f.get("tracking_company")
+
+    line_items = o.get("line_items") or []
+    products = [
+        {"title": li.get("title", "Item"), "quantity": li.get("quantity", 1),
+         "price": li.get("price")}
+        for li in line_items
+    ]
+
+    fulfillment_status = o.get("fulfillment_status") or "unfulfilled"
+    # Simple, honest estimate — not Shopify's own ETA field (often unset for
+    # this store) so we always give the customer *something* useful.
+    if fulfillment_status == "fulfilled":
+        delivery_estimate = "within 2-3 days of shipping"
+    else:
+        delivery_estimate = "within 7-8 days of your order date"
+
+    return {
+        "order_number": o.get("order_number") or o.get("name"),
+        "financial_status": o.get("financial_status"),
+        "fulfillment_status": fulfillment_status,
+        "total_price": o.get("total_price"),
+        "created_at": o.get("created_at"),
+        "tracking_number": tracking_number,
+        "tracking_url": tracking_url,
+        "tracking_company": tracking_company,
+        "delivery_estimate": delivery_estimate,
+        "products": products,
+    }
+
+def extract_email(text):
+    """PHASE 4: pulls an email address out of free text, if present."""
+    match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
+    return match.group(0) if match else None
 
 
 def extract_order_number(text):
@@ -519,15 +581,26 @@ def build_order_status_reply(orders):
     """PHASE 4: formats Shopify order results into a WhatsApp-friendly reply."""
     if not orders:
         return ("I couldn't find a recent order linked to this number. "
-                "Could you share your order number so I can check for you? 😊")
+                "Could you share your order number, the email you used, or "
+                "the mobile number on the order so I can look it up? 😊")
     lines = ["Here's what I found for your recent order(s):\n"]
     for o in orders:
         status = o["fulfillment_status"].replace("_", " ").title()
-        lines.append(
+        block = (
             f"🧾 Order #{o['order_number']}\n"
             f"💰 Total: Rs.{o['total_price']}\n"
             f"📦 Status: {status}\n"
         )
+        if o.get("products"):
+            block += "👗 Items:\n"
+            for p in o["products"]:
+                block += f"   • {p['title']} x{p['quantity']} — Rs.{p['price']}\n"
+        if o.get("tracking_number"):
+            block += f"🚚 Tracking ({o.get('tracking_company') or 'Courier'}): {o['tracking_number']}\n"
+        if o.get("tracking_url"):
+            block += f"🔗 Track here: {o['tracking_url']}\n"
+        block += f"📅 Expected delivery: {o['delivery_estimate']}\n"
+        lines.append(block)
     lines.append("Let me know if you need anything else! 😊")
     return "\n".join(lines)
 def extract_prices(text):
@@ -1032,18 +1105,31 @@ def ai_reply():
             "images": image_list,
             "type": "product" if top_image else "text"
         })
-    # ── 4a-2. Order status — look up real Shopify order, no Groq ──
+      # ── 4a-2. Order status — look up real Shopify order, no Groq ──
     order_number = extract_order_number(message)
+    email = extract_email(message)
+    phone_in_msg = re.search(r'\b\d{10}\b', re.sub(r'\D', ' ', message))
     if order_number:
         orders = lookup_order_by_number(order_number)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Order number lookup for {customer_id} (#{order_number}) -> {len(orders)} order(s) found")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
+    elif email:
+        orders = lookup_order_by_email(email)
+        reply = build_order_status_reply(orders)
+        print(f"[PHASE4] Email lookup for {customer_id} -> {len(orders)} order(s) found")
+        log_message(customer_id, "outgoing", reply)
+        return jsonify({"reply": reply, "image": None, "type": "text"})
+    elif phone_in_msg and was_just_asked_for_order_number(customer_id):
+        orders = lookup_order_by_phone(phone_in_msg.group(0))
+        reply = build_order_status_reply(orders)
+        print(f"[PHASE4] Phone-in-message lookup for {customer_id} -> {len(orders)} order(s) found")
+        log_message(customer_id, "outgoing", reply)
+        return jsonify({"reply": reply, "image": None, "type": "text"})
     elif was_just_asked_for_order_number(customer_id):
-        # Bare reply after we asked for an order number, but extract_order_number found nothing usable
-        reply = "I couldn't find an order matching that number — could you double check and resend just the order number (e.g. 2112)?"
-        print(f"[PHASE4] Order-number follow-up expected for {customer_id} but no valid number extracted from: {message}")
+        reply = "I couldn't match that — could you resend just your order number, email, or mobile number?"
+        print(f"[PHASE4] Follow-up expected for {customer_id} but nothing usable extracted from: {message}")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
     elif any(kw in msg_lower for kw in ORDER_STATUS_KEYWORDS):
