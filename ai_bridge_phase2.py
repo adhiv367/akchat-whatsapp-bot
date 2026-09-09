@@ -355,43 +355,34 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 
 def lookup_order_by_phone(phone_number):
-    """PHASE 4: looks up the customer's most recent order(s) on Shopify by
-    phone number. Two-step: find the customer via customers/search.json
-    (orders.json has no working phone filter), then fetch that customer's
-    orders directly. Returns [] if no matching customer / on any error."""
-    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
+    """PHASE 4 (rebuilt): looks up order(s) by phone using our own local
+    phone->order mapping table (synced via Shopify order webhooks), then
+    reuses the already-working lookup_order_by_number() to fetch live
+    status. Avoids Shopify's read_customers / Protected Customer Data
+    approval entirely. Returns [] if no local match or on any error."""
+    digits = re.sub(r'\D', '', phone_number)[-10:]
+    if not digits:
+        return []
+    conn = get_db_conn()
+    if not conn:
         return []
     try:
-        digits = re.sub(r'\D', '', phone_number)
-        headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
-
-        search_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/customers/search.json"
-        search_resp = requests.get(
-            search_url, headers=headers,
-            params={"query": digits}, timeout=10
-        )
-        if search_resp.status_code != 200:
-            print(f"[PHASE4] Shopify customer-search failed: {search_resp.status_code} {search_resp.text[:200]}")
-            return []
-        customers = search_resp.json().get("customers", [])
-        if not customers:
-            print(f"[PHASE4] No Shopify customer found for phone digits={digits}")
-            return []
-        customer_id = customers[0]["id"]
-
-        orders_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/customers/{customer_id}/orders.json"
-        orders_resp = requests.get(
-            orders_url, headers=headers,
-            params={"status": "any", "limit": 3}, timeout=10
-        )
-        if orders_resp.status_code != 200:
-            print(f"[PHASE4] Shopify customer-orders lookup failed: {orders_resp.status_code} {orders_resp.text[:200]}")
-            return []
-        orders = orders_resp.json().get("orders", [])
-        return [_summarize_order(o) for o in orders]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT order_number FROM coexistence.shopify_orders "
+                "WHERE phone_digits = %s ORDER BY order_created_at DESC LIMIT 3",
+                (digits,),
+            )
+            rows = cur.fetchall()
     except Exception as e:
-        print(f"[PHASE4] lookup_order_by_phone error: {e}")
+        print(f"[PHASE4] local phone lookup failed: {e}")
         return []
+    finally:
+        conn.close()
+    if not rows:
+        print(f"[PHASE4] No local order match for phone digits={digits}")
+        return []
+    return lookup_order_by_number(rows[0][0])
 
 def embed_product_chunk(handle, sku, text):
     """PHASE 1 (webhook auto-embed): mirrors sync_products_to_pg.py's logic
@@ -1122,8 +1113,6 @@ def ai_reply():
         print(f"[PHASE4] Email lookup for {customer_id} -> {len(orders)} order(s) found")
         log_message(customer_id, "outgoing", reply)
         return jsonify({"reply": reply, "image": None, "type": "text"})
-    elif phone_in_msg:
-        orders = lookup_order_by_phone(phone_in_msg.group(0))
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Phone-in-message lookup for {customer_id} -> {len(orders)} order(s) found")
         log_message(customer_id, "outgoing", reply)
@@ -1311,6 +1300,58 @@ def shopify_product_updated():
         notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
         embed_product_chunk(doc['id'], details.get("SKU", ""), doc["text"])
         return jsonify({"status": "updated"})
+
+
+@app.route("/shopify/order-created", methods=["POST"])
+def shopify_order_created():
+    return _sync_order_to_db(request.json)
+
+
+@app.route("/shopify/order-updated", methods=["POST"])
+def shopify_order_updated():
+    return _sync_order_to_db(request.json)
+
+
+def _sync_order_to_db(order):
+    """PHASE 4: upserts a phone/email -> order_number mapping into our
+    local table whenever Shopify sends an order webhook, so
+    lookup_order_by_phone() can find orders without needing Shopify's
+    read_customers scope."""
+    phone_raw = (
+        order.get("phone")
+        or (order.get("customer") or {}).get("phone")
+        or (order.get("shipping_address") or {}).get("phone")
+        or ""
+    )
+    phone_digits = re.sub(r"\D", "", phone_raw)[-10:] if phone_raw else None
+    email = (order.get("email") or "").strip().lower() or None
+    conn = get_db_conn()
+    if not conn:
+        return jsonify({"status": "db unavailable"})
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO coexistence.shopify_orders
+                    (shopify_order_id, order_number, phone_digits, email, order_created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (shopify_order_id) DO UPDATE SET
+                    order_number = EXCLUDED.order_number,
+                    phone_digits = EXCLUDED.phone_digits,
+                    email = EXCLUDED.email,
+                    synced_at = now()
+                """,
+                (order["id"], order.get("name", "").lstrip("#"), phone_digits, email, order.get("created_at")),
+            )
+        conn.commit()
+        print(f"[PHASE4] Synced order #{order.get('name')} to local DB")
+        return jsonify({"status": "synced"})
+    except Exception as e:
+        conn.rollback()
+        print(f"[PHASE4] order sync failed: {e}")
+        return jsonify({"status": "error"})
+    finally:
+        conn.close()
 
 
 @app.route("/shopify/product-deleted", methods=["POST"])
