@@ -6,6 +6,7 @@ import os
 import re
 import hmac
 import hashlib
+import base64
 import secrets
 import time
 from urllib.parse import urlencode
@@ -360,6 +361,7 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 SHOPIFY_OAUTH_SCOPES = "read_orders,read_all_orders,read_products,read_customers"
 SHOPIFY_OAUTH_REDIRECT_URI = "https://akchat-whatsapp-bot.onrender.com/shopify/oauth/callback"
 
@@ -1318,14 +1320,43 @@ def shopify_product_updated():
         return jsonify({"status": "updated"})
 
 
+def verify_shopify_webhook(req):
+    """PHASE 4 SECURITY: verifies Shopify's X-Shopify-Hmac-SHA256 signature
+    over the RAW request body using SHOPIFY_WEBHOOK_SECRET. Must run BEFORE
+    any req.json access -- Shopify signs the raw bytes, and Flask's .json
+    parsing consumes the stream. Returns the raw body bytes on success,
+    or None if verification fails (missing secret, missing header, or
+    signature mismatch). Never logs the secret or the received signature."""
+    if not SHOPIFY_WEBHOOK_SECRET:
+        print("[WEBHOOK] Rejected: SHOPIFY_WEBHOOK_SECRET not configured")
+        return None
+    raw_body = req.get_data()
+    received_hmac = req.headers.get("X-Shopify-Hmac-SHA256", "")
+    if not received_hmac:
+        print("[WEBHOOK] Rejected: missing X-Shopify-Hmac-SHA256 header")
+        return None
+    computed = hmac.new(SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    computed_b64 = base64.b64encode(computed).decode("utf-8")
+    if not hmac.compare_digest(computed_b64, received_hmac):
+        print("[WEBHOOK] Rejected: hmac mismatch")
+        return None
+    return raw_body
+
+
 @app.route("/shopify/order-created", methods=["POST"])
 def shopify_order_created():
-    return _sync_order_to_db(request.json)
+    raw_body = verify_shopify_webhook(request)
+    if raw_body is None:
+        return "Unauthorized", 401
+    return _sync_order_to_db(json.loads(raw_body))
 
 
 @app.route("/shopify/order-updated", methods=["POST"])
 def shopify_order_updated():
-    return _sync_order_to_db(request.json)
+    raw_body = verify_shopify_webhook(request)
+    if raw_body is None:
+        return "Unauthorized", 401
+    return _sync_order_to_db(json.loads(raw_body))
 
 
 def _sync_order_to_db(order):
