@@ -1,9 +1,14 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import json
 import requests
 import os
 import re
+import hmac
+import hashlib
+import secrets
+import time
+from urllib.parse import urlencode
 
 # PHASE 2: added for persistent memory (replaces in-memory recent_suggestions dict)
 import psycopg2
@@ -353,6 +358,10 @@ def embed_text(text):
     return [v / norm for v in truncated] if norm > 0 else truncated
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "")
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+SHOPIFY_OAUTH_SCOPES = "read_orders,read_all_orders,read_products,read_customers"
+SHOPIFY_OAUTH_REDIRECT_URI = "https://akchat-whatsapp-bot.onrender.com/shopify/oauth/callback"
 
 def lookup_order_by_phone(phone_number):
     """PHASE 4 (rebuilt): looks up order(s) by phone using our own local
@@ -1371,6 +1380,114 @@ def shopify_product_deleted():
     save_products(products)
     print(f"[SHOPIFY] Deleted product: {handle} ({before} -> {len(products)})")
     return jsonify({"status": "deleted", "remaining": len(products)})
+
+@app.route("/shopify/oauth/install", methods=["GET"])
+def shopify_oauth_install():
+    """One-time manual trigger: visit this URL in a browser to start the
+    OAuth authorization_code flow and get a permanent (non-expiring)
+    offline access token, replacing the ~24hr client_credentials token.
+    Not called automatically by Shopify -- you visit it yourself once."""
+    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        return "SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET not set", 500
+
+    nonce = secrets.token_urlsafe(24)
+    timestamp = str(int(time.time()))
+    payload = f"{nonce}.{timestamp}"
+    signature = hmac.new(
+        SHOPIFY_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    state = f"{payload}.{signature}"
+
+    params = {
+        "client_id": SHOPIFY_CLIENT_ID,
+        "scope": SHOPIFY_OAUTH_SCOPES,
+        "redirect_uri": SHOPIFY_OAUTH_REDIRECT_URI,
+        "state": state,
+    }
+    auth_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/oauth/authorize?{urlencode(params)}"
+    print(f"[OAUTH] Redirecting to Shopify authorize screen for {SHOPIFY_STORE_DOMAIN}")
+    return redirect(auth_url)
+
+
+@app.route("/shopify/oauth/callback", methods=["GET"])
+def shopify_oauth_callback():
+    """Receives the authorization code after the merchant approves the
+    install, verifies the request is genuinely from Shopify and not
+    replayed/forged, then exchanges the code for a permanent offline
+    access token. Displays the token ONCE in the browser response --
+    never logged, never auto-saved -- for manual copy into Render's
+    SHOPIFY_ACCESS_TOKEN env var."""
+    args = request.args.to_dict()
+    shop = args.get("shop", "")
+    code = args.get("code", "")
+    state = args.get("state", "")
+    received_hmac = args.get("hmac", "")
+
+    if shop != SHOPIFY_STORE_DOMAIN or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$", shop):
+        print(f"[OAUTH] Rejected callback: unexpected shop={shop!r}")
+        return "Invalid shop", 400
+
+    try:
+        nonce, timestamp, signature = state.split(".")
+        expected_sig = hmac.new(
+            SHOPIFY_CLIENT_SECRET.encode(), f"{nonce}.{timestamp}".encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            print("[OAUTH] Rejected callback: state signature mismatch")
+            return "Invalid state", 400
+        if time.time() - int(timestamp) > 600:
+            print("[OAUTH] Rejected callback: state expired")
+            return "State expired, please retry /shopify/oauth/install", 400
+    except (ValueError, TypeError):
+        print("[OAUTH] Rejected callback: malformed state")
+        return "Invalid state", 400
+
+    check_params = {k: v for k, v in args.items() if k != "hmac"}
+    message = "&".join(f"{k}={v}" for k, v in sorted(check_params.items()))
+    computed_hmac = hmac.new(
+        SHOPIFY_CLIENT_SECRET.encode(), message.encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(computed_hmac, received_hmac):
+        print("[OAUTH] Rejected callback: hmac mismatch")
+        return "Invalid signature", 400
+
+    try:
+        resp = requests.post(
+            f"https://{shop}/admin/oauth/access_token",
+            json={
+                "client_id": SHOPIFY_CLIENT_ID,
+                "client_secret": SHOPIFY_CLIENT_SECRET,
+                "code": code,
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"[OAUTH] Token exchange request failed: {e}")
+        return "Token exchange failed", 500
+
+    if resp.status_code != 200:
+        print(f"[OAUTH] Token exchange failed: {resp.status_code}")
+        return f"Token exchange failed ({resp.status_code})", 500
+
+    data = resp.json()
+    token = data.get("access_token", "")
+    scope = data.get("scope", "")
+    has_expiry = "expires_in" in data
+
+    token_tail = token[-4:] if len(token) > 4 else token
+    print(f"[OAUTH] Token exchange succeeded. scope={scope} ends_in={token_tail} has_expires_in={has_expiry}")
+
+    return f"""
+    <html><body style="font-family: monospace; padding: 40px;">
+    <h2>Shopify OAuth complete</h2>
+    <p><b>Copy this token now -- it will not be shown again by this page.</b></p>
+    <textarea readonly style="width:100%; height:60px;">{token}</textarea>
+    <p>Scope granted: {scope}</p>
+    <p>Contains expires_in (should be False/absent for a permanent token): {has_expiry}</p>
+    <p>Paste this into Render &rarr; Environment &rarr; SHOPIFY_ACCESS_TOKEN, then save.</p>
+    </body></html>
+    """
+
 
 @app.route("/health", methods=["GET"])
 def health():
