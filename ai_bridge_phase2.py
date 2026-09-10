@@ -1190,6 +1190,7 @@ CATEGORY_WORDS_MATCH = {
 }
 
 NODE_BACKEND_URL = os.environ.get("NODE_BACKEND_URL", "http://localhost:3011")
+ORDER_CONFIRMATION_TEMPLATE_ID = int(os.environ.get("ORDER_CONFIRMATION_TEMPLATE_ID", "3"))
 
 
 def detect_category(text):
@@ -1348,7 +1349,13 @@ def shopify_order_created():
     raw_body = verify_shopify_webhook(request)
     if raw_body is None:
         return "Unauthorized", 401
-    return _sync_order_to_db(json.loads(raw_body))
+    order = json.loads(raw_body)
+    result = _sync_order_to_db(order)
+    try:
+        send_order_confirmation(order)
+    except Exception as e:
+        print(f"[PHASE4] send_order_confirmation crashed: {e}")
+    return result
 
 
 @app.route("/shopify/order-updated", methods=["POST"])
@@ -1357,6 +1364,83 @@ def shopify_order_updated():
     if raw_body is None:
         return "Unauthorized", 401
     return _sync_order_to_db(json.loads(raw_body))
+
+
+def send_order_confirmation(order):
+    """PHASE 4: sends the order_confirmation WhatsApp template immediately
+    after a Shopify order-created webhook syncs. Idempotent via
+    confirmation_sent_at -- only set on a real 200 from the Node send
+    endpoint, so a Shopify retry naturally re-attempts if the previous
+    call failed (never marks sent before it actually is)."""
+    shopify_order_id = order.get("id")
+    if not shopify_order_id:
+        print("[PHASE4] send_order_confirmation: no shopify order id, skipping")
+        return
+
+    conn = get_db_conn()
+    if not conn:
+        print("[PHASE4] send_order_confirmation: db unavailable, skipping")
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT phone_digits, confirmation_sent_at FROM coexistence.shopify_orders WHERE shopify_order_id = %s",
+                (shopify_order_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            print(f"[PHASE4] send_order_confirmation: no synced row for order {shopify_order_id}, skipping")
+            return
+        phone_digits, confirmation_sent_at = row
+        if confirmation_sent_at is not None:
+            print(f"[PHASE4] send_order_confirmation: already sent for order {shopify_order_id}, skipping")
+            return
+        if not phone_digits:
+            print(f"[PHASE4] send_order_confirmation: no phone on file for order {shopify_order_id}, skipping")
+            return
+
+        customer_number = "91" + phone_digits
+
+        line_items = order.get("line_items") or []
+        item_name = line_items[0].get("name") or line_items[0].get("title") or "Item" if line_items else "Item"
+        quantity = sum(int(li.get("quantity") or 0) for li in line_items) or (line_items[0].get("quantity") if line_items else 1)
+        amount = order.get("total_price") or order.get("current_total_price") or "0"
+        status = order.get("financial_status") or "pending"
+        order_number = (order.get("name") or "").lstrip("#") or str(shopify_order_id)
+
+        variable_mapping = {
+            "1": order_number,
+            "2": item_name,
+            "3": str(quantity),
+            "4": str(amount),
+            "5": str(status),
+        }
+
+        resp = requests.post(
+            NODE_BACKEND_URL + "/api/internal/send-order-confirmation",
+            json={
+                "customer_number": customer_number,
+                "template_id": ORDER_CONFIRMATION_TEMPLATE_ID,
+                "variable_mapping": variable_mapping,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE coexistence.shopify_orders SET confirmation_sent_at = now() WHERE shopify_order_id = %s",
+                    (shopify_order_id,),
+                )
+            conn.commit()
+            print(f"[PHASE4] Order confirmation sent for order {order_number}")
+        else:
+            print(f"[PHASE4] Order confirmation send failed ({resp.status_code}): {resp.text[:300]}")
+    except Exception as e:
+        conn.rollback()
+        print(f"[PHASE4] send_order_confirmation error: {e}")
+    finally:
+        conn.close()
 
 
 def _sync_order_to_db(order):
