@@ -1423,8 +1423,13 @@ def shopify_oauth_callback():
     state = args.get("state", "")
     received_hmac = args.get("hmac", "")
 
-    if shop != SHOPIFY_STORE_DOMAIN or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$", shop):
-        print(f"[OAUTH] Rejected callback: unexpected shop={shop!r}")
+    # Note: a store's admin URL slug (SHOPIFY_STORE_DOMAIN) can differ from
+    # its immutable backend myshopify.com domain if the store was renamed
+    # after creation -- so we only validate the FORMAT here, not exact
+    # equality. Real authenticity is already proven by the state signature
+    # and Shopify's own hmac over this whole callback, checked below.
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$", shop):
+        print(f"[OAUTH] Rejected callback: malformed shop={shop!r}")
         return "Invalid shop", 400
 
     try:
