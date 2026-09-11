@@ -1436,6 +1436,8 @@ def send_order_confirmation(order):
             print(f"[PHASE4] Order confirmation sent for order {order_number}")
         else:
             print(f"[PHASE4] Order confirmation send failed ({resp.status_code}): {resp.text[:300]}")
+            print(f"[PHASE4] Response headers: {dict(resp.headers)}")
+            print(f"[PHASE4] Request URL was: {NODE_BACKEND_URL}/api/internal/send-order-confirmation")
     except Exception as e:
         conn.rollback()
         print(f"[PHASE4] send_order_confirmation error: {e}")
