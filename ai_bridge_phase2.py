@@ -1103,7 +1103,7 @@ def classify_intent_ai(message, conversation_history=None):
         body = {
             "model": "openai/gpt-oss-120b",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 100,
+            "max_tokens": 400,
             "temperature": 0
         }
         response = requests.post(
@@ -1122,7 +1122,7 @@ def classify_intent_ai(message, conversation_history=None):
             raw = raw.replace("json\n", "", 1).replace("json", "", 1).strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not match:
-            print(f"[INTENT-AI] No JSON found in response: {raw}")
+            print(f"[INTENT-AI] No JSON found in response (len={len(raw)}): {raw!r}")
             return None
         parsed = json.loads(match.group(0))
         intent = str(parsed.get("intent", "")).strip().upper()
