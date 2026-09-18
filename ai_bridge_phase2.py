@@ -1026,6 +1026,142 @@ def update_customer_score(wa_number, contact_number, message, detected_intent, s
         conn.close()
 
 
+def build_intent_prompt(message, conversation_history=None):
+    history_text = conversation_history if conversation_history else "(no prior messages)"
+    return f"""You are an intent classifier for a WhatsApp shopping assistant selling women's
+ethnic wear (kurthis, kurthi sets, salwar sets) in Tamil Nadu, India. Customers
+write in Tamil, Tanglish (Tamil in English letters), English, or a mix — often
+with typos and casual phrasing.
+
+Classify the customer's message into EXACTLY ONE of these 7 intents:
+
+1. SUPPORT — complaint, damaged/wrong item, refund, exchange, return request
+   Examples: "damaged product vandhuchu", "wrong item anupiten", "refund venum",
+   "exchange pananum", "not working", "problem iruku order la"
+
+2. EXISTING_CUSTOMER — asking about an order they already placed (tracking, status)
+   Examples: "my order status enna", "engaya order iruku", "tracking number kudunga",
+   "where is my order", "order eppo varum"
+
+3. PURCHASE_INTENT — ready to buy right now, confirming/placing an order
+   Examples: "order panna venum", "idhu vaanga aaguma", "book pandren",
+   "confirm pannunga", "i want this one", "how to order"
+
+4. HOT_LEAD — asking about availability, stock, size, color, delivery/COD
+   (a strong buying signal, but not yet confirming purchase)
+   Examples: "stock iruka", "idhu kedaikuma", "size iruka XL la", "colour options",
+   "cod available ah", "delivery evlo naal", "available ah"
+
+5. WARM_LEAD — asking price/cost
+   Examples: "evlo bro", "price sollunga", "intha dress evlo", "rate enna",
+   "how much", "cost enna"
+
+6. PRODUCT_INTEREST — interested in style/design, asking for similar items
+   Examples: "innoru maari design irukka", "vera colour la irukka",
+   "similar design venum", "designs share pannunga"
+
+7. JUST_BROWSING — greetings, small talk, or anything that doesn't clearly fit above
+   Examples: "hi", "vanakkam", "ok", "nala iruken", general chit-chat
+
+IMPORTANT:
+- Judge by MEANING, not exact words — handle typos, spacing, and Tamil/Tanglish/
+  English mixing (e.g. "idhu evlo" = "how much is this" = WARM_LEAD).
+- If a message could fit two intents, pick the one that signals STRONGER buying
+  intent (SUPPORT/EXISTING_CUSTOMER > PURCHASE_INTENT > HOT_LEAD > WARM_LEAD >
+  PRODUCT_INTEREST > JUST_BROWSING).
+- Consider the recent conversation for context if provided, but classify based
+  on THIS message.
+
+Recent conversation (may be empty):
+{history_text}
+
+Customer's message:
+"{message}"
+
+Respond with ONLY valid JSON, no other text, in exactly this format:
+{{"intent": "ONE_OF_THE_7_LABELS", "score": <integer 0-100>, "confidence": <float 0.0-1.0>}}
+
+Score guide: SUPPORT/EXISTING_CUSTOMER score is not used for ranking (pass 50).
+PURCHASE_INTENT: 85-100. HOT_LEAD: 65-84. WARM_LEAD: 40-64. PRODUCT_INTEREST: 20-39.
+JUST_BROWSING: 0-19."""
+
+
+VALID_INTENTS = {"SUPPORT", "EXISTING_CUSTOMER", "PURCHASE_INTENT", "HOT_LEAD",
+                  "WARM_LEAD", "PRODUCT_INTEREST", "JUST_BROWSING"}
+
+
+def classify_intent_ai(message, conversation_history=None):
+    """AI-based intent classification using the same Groq model as replies,
+    with its own short prompt. Returns (intent, score, confidence) or None
+    on any failure, so the caller can fall back to classify_intent()."""
+    try:
+        prompt = build_intent_prompt(message, conversation_history)
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        body = {
+            "model": "openai/gpt-oss-120b",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 100,
+            "temperature": 0
+        }
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=body,
+            timeout=10
+        )
+        result = response.json()
+        if 'choices' not in result:
+            print(f"[INTENT-AI] Groq error response: {result}")
+            return None
+        raw = result['choices'][0]['message']['content'].strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = raw.replace("json\n", "", 1).replace("json", "", 1).strip()
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            print(f"[INTENT-AI] No JSON found in response: {raw}")
+            return None
+        parsed = json.loads(match.group(0))
+        intent = str(parsed.get("intent", "")).strip().upper()
+        score = int(parsed.get("score", 10))
+        confidence = float(parsed.get("confidence", 0.5))
+        if intent not in VALID_INTENTS:
+            print(f"[INTENT-AI] Invalid intent label returned: {intent}")
+            return None
+        score = max(0, min(100, score))
+        confidence = max(0.0, min(1.0, confidence))
+        return intent, score, confidence
+    except Exception as e:
+        print(f"[INTENT-AI] classify_intent_ai failed: {e}")
+        return None
+
+
+def classify_intent_smart(message, customer_id=None):
+    """Combines cheap keyword bypass with AI classification. Unambiguous
+    keyword matches (complaints, order-status, exact greetings) skip the
+    AI call to save cost. Everything else goes to classify_intent_ai(),
+    falling back to the original keyword rules on any AI failure."""
+    msg_lower = message.lower().strip()
+
+    if msg_lower in QUICK_REPLIES:
+        return "JUST_BROWSING", 10, 0.9
+
+    for intent, keywords, score in INTENT_SIGNAL_TIERS:
+        if intent in ("SUPPORT", "EXISTING_CUSTOMER") and any(kw in msg_lower for kw in keywords):
+            return intent, score, 0.8
+
+    conversation_history = get_recent_conversation(customer_id) if customer_id else None
+    ai_result = classify_intent_ai(message, conversation_history)
+    if ai_result:
+        return ai_result
+
+    return classify_intent(message)
+
+
+
 @app.route("/ai", methods=["POST"])
 def ai_reply():
     data = request.json
@@ -1035,12 +1171,13 @@ def ai_reply():
     if not message:
         return jsonify({"reply": "", "image": None, "type": "text"})
 
+
     # PHASE 2: log every incoming message. This is a plain append — it never
     # affects which branch below runs, so quick replies/SKU/suggestions all
     # behave exactly as before.
     log_message(customer_id, "incoming", message)
 
-    detected_intent, signal_score, confidence = classify_intent(message)
+    detected_intent, signal_score, confidence = classify_intent_smart(message, customer_id)
     update_customer_score(wa_number, customer_id, message, detected_intent, signal_score, confidence)
     print(f"[INTENT] {customer_id}: {detected_intent} (signal={signal_score}, wa_number={wa_number})")
     msg_lower = message.lower().strip()
