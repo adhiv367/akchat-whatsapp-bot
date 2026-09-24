@@ -1937,3 +1937,6 @@ if __name__ == "__main__":
     print(f"GROQ_API_KEY loaded: {'YES' if GROQ_API_KEY else 'NO (missing!)'}")
     print("=" * 60)
     app.run(host="0.0.0.0", port=5050, debug=False)
+    
+print("=== FINAL AI BRIDGE ROUTES ===")
+print(app.url_map)
