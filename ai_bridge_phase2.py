@@ -27,6 +27,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+print("=== AI BRIDGE ROUTES ===")
+print(app.url_map)
+print("=== AI BRIDGE FILE LOADED ===")
+print(__file__)
 CORS(app)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
