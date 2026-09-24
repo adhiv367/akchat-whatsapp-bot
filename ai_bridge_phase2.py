@@ -40,6 +40,11 @@ if GEMINI_API_KEY:
 # backend already uses — Settings → Environment on the Render service).
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# SECURITY (tenant/auth hardening): shared secret AKChat must present on every
+# call to POST /ai. Loaded once at process start — if it is not configured we
+# fail closed (503) rather than silently accepting unauthenticated requests.
+AI_SERVICE_SHARED_SECRET = os.environ.get("AI_SERVICE_SHARED_SECRET", "")
+
 
 def get_db_conn():
     """PHASE 2: single place to open a DB connection. Never throws upward —
@@ -55,11 +60,54 @@ def get_db_conn():
         return None
 
 
-# PHASE 2: get_recent_skus / remember_skus now read/write Postgres instead of
-# the old `recent_suggestions = {}` dict. Same function names, same call
-# sites below — nothing else in the file needed to change for this part.
+# SECURITY (multi-tenant): resolves the workspace that owns a given inbound
+# WhatsApp business number, using coexistence.whatsapp_accounts as the single
+# source of truth (audit-confirmed shape: id, workspace_id,
+# display_phone_number, phone_number_id, is_active — 1 active account,
+# workspace_id=1, no NULL-workspace accounts, no duplicate display numbers).
+#
+# Fails closed: returns None (never guesses / never defaults to workspace 1)
+# whenever the wa_number is missing, unmatched, or ambiguous. Callers must
+# treat None as "cannot proceed for this request".
+def resolve_workspace_id(wa_number):
+    digits = re.sub(r"\D", "", wa_number or "")[-10:]
+    if not digits:
+        return None
+    conn = get_db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT workspace_id
+                FROM coexistence.whatsapp_accounts
+                WHERE is_active = true
+                  AND regexp_replace(display_phone_number, '\\D', '', 'g') LIKE %s
+                """,
+                ('%' + digits,),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"[TENANT] resolve_workspace_id failed: {e}")
+        return None
+    finally:
+        conn.close()
+    if len(rows) != 1:
+        return None
+    return rows[0][0]
 
-def get_recent_skus(customer_id):
+
+# PHASE 2: get_recent_skus / remember_skus now read/write Postgres instead of
+# the old `recent_suggestions = {}` dict.
+#
+# SECURITY (multi-tenant): both now take workspace_id + wa_number in addition
+# to customer_id, and scope every read/write to all three. Legacy rows from
+# before this change have NULL workspace_id/wa_number and are intentionally
+# left alone (not backfilled — ambiguous legacy data per audit) — they simply
+# no longer match new tenant-scoped queries.
+
+def get_recent_skus(customer_id, workspace_id=None, wa_number=None):
     if not customer_id:
         return []
     conn = get_db_conn()
@@ -70,11 +118,11 @@ def get_recent_skus(customer_id):
             cur.execute(
                 """
                 SELECT sku FROM coexistence.shown_products
-                WHERE customer_id = %s
+                WHERE customer_id = %s AND workspace_id = %s AND wa_number = %s
                 ORDER BY shown_at DESC
                 LIMIT 15
                 """,
-                (customer_id,),
+                (customer_id, workspace_id, wa_number),
             )
             return [row[0] for row in cur.fetchall()]
     except Exception as e:
@@ -84,7 +132,7 @@ def get_recent_skus(customer_id):
         conn.close()
 
 
-def remember_skus(customer_id, skus):
+def remember_skus(customer_id, skus, workspace_id=None, wa_number=None):
     if not customer_id or not skus:
         return
     conn = get_db_conn()
@@ -94,8 +142,8 @@ def remember_skus(customer_id, skus):
         with conn.cursor() as cur:
             execute_values(
                 cur,
-                "INSERT INTO coexistence.shown_products (customer_id, sku) VALUES %s",
-                [(customer_id, sku) for sku in skus],
+                "INSERT INTO coexistence.shown_products (customer_id, sku, workspace_id, wa_number) VALUES %s",
+                [(customer_id, sku, workspace_id, wa_number) for sku in skus],
             )
         conn.commit()
     except Exception as e:
@@ -110,7 +158,7 @@ def remember_skus(customer_id, skus):
 # the last few turns for this customer so Groq can see context like
 # "you said the price was X earlier".
 
-def log_message(customer_id, direction, text):
+def log_message(customer_id, direction, text, workspace_id=None, wa_number=None):
     if not customer_id or not text:
         return
     conn = get_db_conn()
@@ -120,10 +168,11 @@ def log_message(customer_id, direction, text):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO coexistence.conversation_messages (customer_id, direction, message_text)
-                VALUES (%s, %s, %s)
+                INSERT INTO coexistence.conversation_messages
+                    (customer_id, direction, message_text, workspace_id, wa_number)
+                VALUES (%s, %s, %s, %s, %s)
                 """,
-                (customer_id, direction, text),
+                (customer_id, direction, text, workspace_id, wa_number),
             )
         conn.commit()
     except Exception as e:
@@ -133,11 +182,16 @@ def log_message(customer_id, direction, text):
         conn.close()
 
 
-def get_recent_conversation(customer_id, limit=6):
+def get_recent_conversation(customer_id, limit=6, workspace_id=None, wa_number=None):
     """Returns the last `limit` messages for this customer, oldest first,
     formatted for dropping straight into the Groq prompt. Empty list if
     there's no history or the DB is unreachable — Groq just gets no extra
-    context in that case, same as today's behavior."""
+    context in that case, same as today's behavior.
+
+    SECURITY (multi-tenant): when workspace_id/wa_number are provided, the
+    read is scoped to all three of (customer_id, workspace_id, wa_number),
+    so history never leaks across tenants sharing the same customer_id. When
+    they are omitted (legacy internal callers), behavior is unchanged."""
     if not customer_id:
         return []
     conn = get_db_conn()
@@ -145,15 +199,26 @@ def get_recent_conversation(customer_id, limit=6):
         return []
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT direction, message_text FROM coexistence.conversation_messages
-                WHERE customer_id = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
-                (customer_id, limit),
-            )
+            if workspace_id is not None or wa_number is not None:
+                cur.execute(
+                    """
+                    SELECT direction, message_text FROM coexistence.conversation_messages
+                    WHERE customer_id = %s AND workspace_id = %s AND wa_number = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (customer_id, workspace_id, wa_number, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT direction, message_text FROM coexistence.conversation_messages
+                    WHERE customer_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (customer_id, limit),
+                )
             rows = cur.fetchall()
         rows.reverse()  # oldest first, for a natural-reading transcript
         return [(direction, text) for direction, text in rows]
@@ -322,7 +387,9 @@ def search(query, products, top_k=3):
 # kurthi" finding "Crimson Bloom Cotton Kurthi") that keyword overlap
 # alone would miss, without changing behavior for anything that already
 # works via keywords.
-def semantic_search_products(query, top_k=3):
+def semantic_search_products(query, top_k=3, workspace_id=None):
+    if not workspace_id:
+        return []
     conn = get_db_conn()
     if not conn:
         return []
@@ -338,7 +405,7 @@ def semantic_search_products(query, top_k=3):
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
-                (1, vector_literal, top_k),
+                (workspace_id, vector_literal, top_k),
             )
             return [row[0] for row in cur.fetchall()]
     except Exception as e:
@@ -365,12 +432,18 @@ SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 SHOPIFY_OAUTH_SCOPES = "read_orders,read_all_orders,read_products,read_customers"
 SHOPIFY_OAUTH_REDIRECT_URI = "https://akchat-whatsapp-bot.onrender.com/shopify/oauth/callback"
 
-def lookup_order_by_phone(phone_number):
+def lookup_order_by_phone(phone_number, workspace_id=None):
     """PHASE 4 (rebuilt): looks up order(s) by phone using our own local
     phone->order mapping table (synced via Shopify order webhooks), then
     reuses the already-working lookup_order_by_number() to fetch live
     status. Avoids Shopify's read_customers / Protected Customer Data
-    approval entirely. Returns [] if no local match or on any error."""
+    approval entirely. Returns [] if no local match or on any error.
+
+    SECURITY (multi-tenant): when workspace_id is known (the normal /ai
+    path), the lookup is scoped to that workspace's own orders. Rows synced
+    before shopify_orders gained workspace_id have NULL there and are
+    intentionally excluded from a workspace-scoped lookup rather than
+    guessed into a tenant."""
     digits = re.sub(r'\D', '', phone_number)[-10:]
     if not digits:
         return []
@@ -379,11 +452,19 @@ def lookup_order_by_phone(phone_number):
         return []
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT order_number FROM coexistence.shopify_orders "
-                "WHERE phone_digits = %s ORDER BY order_created_at DESC LIMIT 3",
-                (digits,),
-            )
+            if workspace_id is not None:
+                cur.execute(
+                    "SELECT order_number FROM coexistence.shopify_orders "
+                    "WHERE phone_digits = %s AND workspace_id = %s "
+                    "ORDER BY order_created_at DESC LIMIT 3",
+                    (digits, workspace_id),
+                )
+            else:
+                cur.execute(
+                    "SELECT order_number FROM coexistence.shopify_orders "
+                    "WHERE phone_digits = %s ORDER BY order_created_at DESC LIMIT 3",
+                    (digits,),
+                )
             rows = cur.fetchall()
     except Exception as e:
         print(f"[PHASE4] local phone lookup failed: {e}")
@@ -401,7 +482,17 @@ def embed_product_chunk(handle, sku, text):
     semantically searchable immediately, without waiting for a manual
     sync_products_to_pg.py re-run. Safe to call repeatedly for the same
     product — deletes any existing embedded document for this handle
-    first, same re-run-safe pattern as the bulk sync script."""
+    first, same re-run-safe pattern as the bulk sync script.
+
+    SECURITY (multi-tenant): like _sync_order_to_db, this webhook carries no
+    wa_number to resolve a workspace from, so it uses
+    resolve_sole_active_workspace() (queried, not hardcoded) instead of a
+    literal workspace_id. Skips the embed entirely — rather than guessing —
+    the moment more than one active workspace exists."""
+    workspace_id = resolve_sole_active_workspace()
+    if not workspace_id:
+        print("[PHASE1] embed_product_chunk skipped — workspace could not be uniquely resolved")
+        return
     conn = get_db_conn()
     if not conn:
         print("[PHASE1] embed_product_chunk skipped — no DB connection")
@@ -412,7 +503,7 @@ def embed_product_chunk(handle, sku, text):
                 "DELETE FROM coexistence.knowledge_documents "
                 "WHERE workspace_id = %s AND source_type = 'product' "
                 "AND metadata->>'handle' = %s",
-                (1, handle),
+                (workspace_id, handle),
             )
             title = sku or handle or "product"
             cur.execute(
@@ -422,7 +513,7 @@ def embed_product_chunk(handle, sku, text):
                 VALUES (%s, 'product', %s, %s, %s)
                 RETURNING id
                 """,
-                (1, title, text, json.dumps({"handle": handle, "sku": sku})),
+                (workspace_id, title, text, json.dumps({"handle": handle, "sku": sku})),
             )
             document_id = cur.fetchone()[0]
             vector = embed_text(text)
@@ -433,7 +524,7 @@ def embed_product_chunk(handle, sku, text):
                     (document_id, workspace_id, chunk_text, embedding, token_count)
                 VALUES (%s, %s, %s, %s, %s)
                 """,
-                (document_id, 1, text, vector_literal, len(text) // 4),
+                (document_id, workspace_id, text, vector_literal, len(text) // 4),
             )
         conn.commit()
         print(f"[PHASE1] Embedded product for semantic search: {title}")
@@ -562,11 +653,11 @@ def extract_order_number(text):
     return match.group(1) if match else None
 
 
-def was_just_asked_for_order_number(customer_id):
+def was_just_asked_for_order_number(customer_id, workspace_id=None, wa_number=None):
     """PHASE 4: checks if our last outgoing message to this customer was
     the 'share your order number' fallback, so a bare number reply right
     after it gets treated as an order number even without other keywords."""
-    history = get_recent_conversation(customer_id, limit=2)
+    history = get_recent_conversation(customer_id, limit=2, workspace_id=workspace_id, wa_number=wa_number)
     for direction, text in reversed(history):
         if direction == "outgoing":
             return "share your order number" in text.lower()
@@ -655,14 +746,17 @@ def validate_reply(reply, context, policy_context=None, products=None):
         return False, "Let me double-check that price for you and get right back to you! In the meantime, feel free to browse our collection at https://www.invicreation.com 😊"
     return True, reply
 
-def search_policy_faq(message, limit=2):
+def search_policy_faq(message, limit=2, workspace_id=None):
     """PHASE 5: simple keyword search against the FAQ/policy knowledge base
     (built in Phase 1). No embeddings, no extra API calls — just a plain
     database search, matching this bot's existing style of preferring
-    simple rules over AI where possible."""
+    simple rules over AI where possible.
+
+    SECURITY (multi-tenant): scoped to the caller-resolved workspace_id
+    instead of a hardcoded value; returns [] if none is available."""
     msg_lower = message.lower()
     matched_terms = [kw for kw in POLICY_KEYWORDS if kw in msg_lower]
-    if not matched_terms:
+    if not matched_terms or not workspace_id:
         return []
     conn = get_db_conn()
     if not conn:
@@ -674,7 +768,7 @@ def search_policy_faq(message, limit=2):
             cur.execute(
                 f"SELECT DISTINCT chunk_text FROM coexistence.knowledge_chunks "
                 f"WHERE workspace_id = %s AND ({conditions}) LIMIT %s",
-                [1] + params + [limit],
+                [workspace_id] + params + [limit],
             )
             return [row[0] for row in cur.fetchall()]
     except Exception as e:
@@ -700,11 +794,15 @@ def detect_color(text):
     return None
 
 
-def log_customer_interest(customer_id, product_sku, product_name, category):
+def log_customer_interest(customer_id, product_sku, product_name, category, workspace_id=None):
     print(f"[DEBUG] log_customer_interest called: customer_id={customer_id}, sku={product_sku}, category={category}")
     """PHASE 3: records that this customer was shown a product, for later
-    matching against new arrivals. Fail-quiet, same as other DB helpers."""
-    if not customer_id or not category:
+    matching against new arrivals. Fail-quiet, same as other DB helpers.
+
+    SECURITY (multi-tenant): workspace_id is now caller-resolved (see
+    resolve_workspace_id) instead of hardcoded to 1. No workspace_id ->
+    no write, rather than guessing."""
+    if not customer_id or not category or not workspace_id:
         return
     color = detect_color(product_name)
     conn = get_db_conn()
@@ -721,7 +819,7 @@ def log_customer_interest(customer_id, product_sku, product_name, category):
                     WHERE status = 'open'
                     DO NOTHING
                 """,
-                (1, customer_id, product_sku, category, color),
+                (workspace_id, customer_id, product_sku, category, color),
             )
         conn.commit()
     except Exception as e:
@@ -731,7 +829,7 @@ def log_customer_interest(customer_id, product_sku, product_name, category):
         conn.close()
 
 
-def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer_id=None):
+def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer_id=None, workspace_id=None):
     """Pick real distinct products and build a clean suggestion reply directly (no Groq)"""
     query_lower = query.lower()
     query_words = set(query_lower.split())
@@ -792,7 +890,7 @@ def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer
         picked.extend(fallback[:top_k - len(picked)])
 
     for details in picked:
-        log_customer_interest(customer_id, details.get("SKU", ""), details.get("Product", ""), matched_category)
+        log_customer_interest(customer_id, details.get("SKU", ""), details.get("Product", ""), matched_category, workspace_id=workspace_id)
 
     if not picked:
         return "Sorry, I couldn't find matching products right now. You can browse our full collection at https://www.invicreation.com 😊", None, []
@@ -962,10 +1060,15 @@ def score_to_label(score):
     return "JUST_BROWSING"
 
 
-def update_customer_score(wa_number, contact_number, message, detected_intent, signal_score, confidence):
+def update_customer_score(workspace_id, wa_number, contact_number, message, detected_intent, signal_score, confidence):
     """Blends this message's signal with the customer's existing score, so
     one message doesn't wildly swing their classification, while repeated
-    behavior still shifts them Cold -> Warm -> Hot over time."""
+    behavior still shifts them Cold -> Warm -> Hot over time.
+
+    SECURITY (multi-tenant): workspace_id is now caller-resolved (see
+    resolve_workspace_id) instead of hardcoded to 1."""
+    if not workspace_id:
+        return
     conn = get_db_conn()
     if not conn:
         return
@@ -977,7 +1080,7 @@ def update_customer_score(wa_number, contact_number, message, detected_intent, s
                 FROM coexistence.customer_intent_profiles
                 WHERE workspace_id = %s AND wa_number = %s AND contact_number = %s
                 """,
-                (1, wa_number, contact_number),
+                (workspace_id, wa_number, contact_number),
             )
             row = cur.fetchone()
             old_intent = row[0] if row else "JUST_BROWSING"
@@ -1005,7 +1108,7 @@ def update_customer_score(wa_number, contact_number, message, detected_intent, s
                     last_intent_update = NOW(),
                     updated_at = NOW()
                 """,
-                (1, wa_number, contact_number, new_intent, new_score, confidence),
+                (workspace_id, wa_number, contact_number, new_intent, new_score, confidence),
             )
 
             if new_intent != old_intent or new_score != old_score:
@@ -1016,7 +1119,7 @@ def update_customer_score(wa_number, contact_number, message, detected_intent, s
                          new_intent, previous_score, new_score, trigger_message)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (1, wa_number, contact_number, old_intent, new_intent, old_score, new_score, message[:500]),
+                    (workspace_id, wa_number, contact_number, old_intent, new_intent, old_score, new_score, message[:500]),
                 )
         conn.commit()
     except Exception as e:
@@ -1139,7 +1242,7 @@ def classify_intent_ai(message, conversation_history=None):
         return None
 
 
-def classify_intent_smart(message, customer_id=None):
+def classify_intent_smart(message, customer_id=None, workspace_id=None, wa_number=None):
     """Combines cheap keyword bypass with AI classification. Unambiguous
     keyword matches (complaints, order-status, exact greetings) skip the
     AI call to save cost. Everything else goes to classify_intent_ai(),
@@ -1153,7 +1256,10 @@ def classify_intent_smart(message, customer_id=None):
         if intent in ("SUPPORT", "EXISTING_CUSTOMER") and any(kw in msg_lower for kw in keywords):
             return intent, score, 0.8
 
-    conversation_history = get_recent_conversation(customer_id) if customer_id else None
+    conversation_history = (
+        get_recent_conversation(customer_id, workspace_id=workspace_id, wa_number=wa_number)
+        if customer_id else None
+    )
     ai_result = classify_intent_ai(message, conversation_history)
     if ai_result:
         return ai_result
@@ -1164,21 +1270,44 @@ def classify_intent_smart(message, customer_id=None):
 
 @app.route("/ai", methods=["POST"])
 def ai_reply():
-    data = request.json
+    # SECURITY (auth): AI_SERVICE_SHARED_SECRET must be configured, or every
+    # request is unverifiable — fail closed rather than run open.
+    if not AI_SERVICE_SHARED_SECRET:
+        print("[AUTH] AI_SERVICE_SHARED_SECRET is not configured — refusing all /ai requests")
+        return jsonify({"error": "service_unavailable"}), 503
+
+    # SECURITY (auth): constant-time comparison against the caller-supplied
+    # secret. Missing or wrong secret -> 401, before any DB/LLM work happens.
+    supplied_secret = request.headers.get("X-AI-Service-Secret", "")
+    if not supplied_secret or not hmac.compare_digest(supplied_secret, AI_SERVICE_SHARED_SECRET):
+        print("[AUTH] /ai request rejected: missing or invalid X-AI-Service-Secret")
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
     message = data.get("message", "").strip()
     customer_id = data.get("customer_id", "")
     wa_number = data.get("wa_number", "")
     if not message:
         return jsonify({"reply": "", "image": None, "type": "text"})
 
+    # SECURITY (multi-tenant): resolve the owning workspace from wa_number via
+    # whatsapp_accounts. Fail closed — if it can't be resolved to exactly one
+    # workspace, do not log, classify, score, or reply; a workspace we can't
+    # identify is treated the same as a request we can't trust.
+    workspace_id = resolve_workspace_id(wa_number)
+    if not workspace_id:
+        print(f"[TENANT] /ai request rejected: workspace could not be uniquely resolved for wa_number={wa_number!r}")
+        return jsonify({"error": "workspace_not_resolved"}), 422
 
     # PHASE 2: log every incoming message. This is a plain append — it never
     # affects which branch below runs, so quick replies/SKU/suggestions all
     # behave exactly as before.
-    log_message(customer_id, "incoming", message)
+    log_message(customer_id, "incoming", message, workspace_id=workspace_id, wa_number=wa_number)
 
-    detected_intent, signal_score, confidence = classify_intent_smart(message, customer_id)
-    update_customer_score(wa_number, customer_id, message, detected_intent, signal_score, confidence)
+    detected_intent, signal_score, confidence = classify_intent_smart(
+        message, customer_id, workspace_id=workspace_id, wa_number=wa_number
+    )
+    update_customer_score(workspace_id, wa_number, customer_id, message, detected_intent, signal_score, confidence)
     print(f"[INTENT] {customer_id}: {detected_intent} (signal={signal_score}, wa_number={wa_number})")
     msg_lower = message.lower().strip()
 
@@ -1186,7 +1315,7 @@ def ai_reply():
     if msg_lower in QUICK_REPLIES:
         print(f"[CACHE] {message}")
         reply_text = QUICK_REPLIES[msg_lower]
-        log_message(customer_id, "outgoing", reply_text)  # PHASE 2
+        log_message(customer_id, "outgoing", reply_text, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
         return jsonify({
             "reply": reply_text,
             "image": None,
@@ -1196,7 +1325,7 @@ def ai_reply():
     # ── 2. Company details ──
     if any(kw in msg_lower for kw in COMPANY_KEYWORDS):
         print(f"[COMPANY] {message}")
-        log_message(customer_id, "outgoing", COMPANY_REPLY)  # PHASE 2
+        log_message(customer_id, "outgoing", COMPANY_REPLY, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
         return jsonify({
             "reply": COMPANY_REPLY,
             "image": None,
@@ -1213,7 +1342,7 @@ def ai_reply():
             details = parse_product_details(product)
             reply, image_url = build_product_reply(details)
             print(f"[SKU] {sku} → {details.get('Product', '')}")
-            log_message(customer_id, "outgoing", reply)  # PHASE 2
+            log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
             return jsonify({
                 "reply": reply,
                 "image": image_url,
@@ -1221,7 +1350,7 @@ def ai_reply():
             })
         else:
             not_found_reply = f"Sorry, I could not find product *{sku}*. Please check the SKU and try again. You can browse our collection at https://www.invicreation.com 😊"
-            log_message(customer_id, "outgoing", not_found_reply)  # PHASE 2
+            log_message(customer_id, "outgoing", not_found_reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
             return jsonify({
                 "reply": not_found_reply,
                 "image": None,
@@ -1236,7 +1365,7 @@ def ai_reply():
     if any(kw in msg_lower for kw in collection_overview_keywords):
         reply, top_image, image_list = build_collection_overview_reply(products)
         print(f"[OVERVIEW] {message} -> {len(image_list)} categories")
-        log_message(customer_id, "outgoing", reply)  # PHASE 2
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
         return jsonify({
             "reply": reply,
             "image": top_image,
@@ -1247,19 +1376,19 @@ def ai_reply():
     order_number = extract_order_number(message)
     email = extract_email(message)
     phone_in_msg = re.search(r'\b\d{10}\b', re.sub(r'\D', ' ', message))
-    _debug_history = get_recent_conversation(customer_id, limit=2)
-    print(f"[PHASE4-DEBUG] order_number={order_number} email={email} phone_in_msg={phone_in_msg.group(0) if phone_in_msg else None} was_just_asked={was_just_asked_for_order_number(customer_id)} history={_debug_history}")
+    _debug_history = get_recent_conversation(customer_id, limit=2, workspace_id=workspace_id, wa_number=wa_number)
+    print(f"[PHASE4-DEBUG] order_number={order_number} email={email} phone_in_msg={phone_in_msg.group(0) if phone_in_msg else None} was_just_asked={was_just_asked_for_order_number(customer_id, workspace_id=workspace_id, wa_number=wa_number)} history={_debug_history}")
     if order_number:
         orders = lookup_order_by_number(order_number)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Order number lookup for {customer_id} (#{order_number}) -> {len(orders)} order(s) found")
-        log_message(customer_id, "outgoing", reply)
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)
         return jsonify({"reply": reply, "image": None, "type": "text"})
     elif email:
         orders = lookup_order_by_email(email)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Email lookup for {customer_id} -> {len(orders)} order(s) found")
-        log_message(customer_id, "outgoing", reply)
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)
         return jsonify({"reply": reply, "image": None, "type": "text"})
     elif phone_in_msg:
         # SECURITY: never look up by the typed digits themselves -- that would let
@@ -1267,33 +1396,33 @@ def ai_reply():
         # A phone number in the message is only a signal this is an order-status
         # request; lookup always uses the sender's own authenticated identity
         # (customer_id), same as the keyword branch below.
-        orders = lookup_order_by_phone(customer_id)
+        orders = lookup_order_by_phone(customer_id, workspace_id=workspace_id)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Phone-in-message lookup for {customer_id} -> {len(orders)} order(s) found")
-        log_message(customer_id, "outgoing", reply)
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)
         return jsonify({"reply": reply, "image": None, "type": "text"})
-    elif was_just_asked_for_order_number(customer_id):
+    elif was_just_asked_for_order_number(customer_id, workspace_id=workspace_id, wa_number=wa_number):
         reply = "I couldn't match that -- could you resend just your order number, email, or mobile number?"
         print(f"[PHASE4] Follow-up expected for {customer_id} but nothing usable extracted from: {message}")
-        log_message(customer_id, "outgoing", reply)
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)
         return jsonify({"reply": reply, "image": None, "type": "text"})
     elif any(kw in msg_lower for kw in ORDER_STATUS_KEYWORDS):
-        orders = lookup_order_by_phone(customer_id)
+        orders = lookup_order_by_phone(customer_id, workspace_id=workspace_id)
         reply = build_order_status_reply(orders)
         print(f"[PHASE4] Order status lookup for {customer_id} -> {len(orders)} order(s) found")
-        log_message(customer_id, "outgoing", reply)
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)
         return jsonify({"reply": reply, "image": None, "type": "text"})
 
     # ── 4b. Dress/collection suggestion — build directly from real data, no Groq ──
     suggest_keywords = ["suggest", "show me", "recommend", "options", "collection"] + DRESS_KEYWORDS
     has_policy_question = any(kw in msg_lower for kw in POLICY_KEYWORDS)  # PHASE 5
     if any(kw in msg_lower for kw in suggest_keywords) and not has_policy_question:  # PHASE 5: fall through to Groq if a policy question is also present
-        already_shown = get_recent_skus(customer_id)
-        reply, top_image, image_list = build_suggestion_reply(message, products, top_k=5, exclude_skus=already_shown, customer_id=customer_id)
+        already_shown = get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number)
+        reply, top_image, image_list = build_suggestion_reply(message, products, top_k=5, exclude_skus=already_shown, customer_id=customer_id, workspace_id=workspace_id)
         shown_skus = [item["sku"] for item in image_list]
-        remember_skus(customer_id, shown_skus)
+        remember_skus(customer_id, shown_skus, workspace_id=workspace_id, wa_number=wa_number)
         print(f"[SUGGEST] {message} (customer={customer_id}) -> {len(image_list)} products, excluded {len(already_shown)}")
-        log_message(customer_id, "outgoing", reply)  # PHASE 2
+        log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
         return jsonify({
             "reply": reply,
             "image": top_image,
@@ -1305,15 +1434,15 @@ def ai_reply():
     if not context:
         # PHASE 1: plain keyword search found nothing -- try semantic
         # search before giving up, catches synonym-style queries.
-        context = semantic_search_products(message)
+        context = semantic_search_products(message, workspace_id=workspace_id)
         if context:
             print("[PHASE1] Semantic fallback matched for: " + message)
-    policy_context = search_policy_faq(message)  # PHASE 5
-    conversation_history = get_recent_conversation(customer_id)  # PHASE 2
+    policy_context = search_policy_faq(message, workspace_id=workspace_id)  # PHASE 5
+    conversation_history = get_recent_conversation(customer_id, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
     reply = ask_groq(message, context, conversation_history, policy_context)  # PHASE 5: policy added
     is_valid, reply = validate_reply(reply, context, policy_context, products)  # PHASE 6
     print(f"[GROQ] {message}" + ("" if is_valid else " [PHASE6: blocked unverified price]"))
-    log_message(customer_id, "outgoing", reply)  # PHASE 2
+    log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
     return jsonify({
         "reply": reply,
         "image": None,
@@ -1327,6 +1456,7 @@ CATEGORY_WORDS_MATCH = {
 }
 
 NODE_BACKEND_URL = os.environ.get("NODE_BACKEND_URL", "http://localhost:3011")
+INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 ORDER_CONFIRMATION_TEMPLATE_ID = int(os.environ.get("ORDER_CONFIRMATION_TEMPLATE_ID", "3"))
 
 
@@ -1358,6 +1488,7 @@ def prepare_followup_for_interest(interest_id, customer_number, category, color,
     try:
         resp = requests.post(
             NODE_BACKEND_URL + "/api/internal/prepare-followup",
+            headers={"X-Internal-Secret": INTERNAL_API_SECRET},
             json={
                 "customer_number": customer_number,
                 "template_id": int(INTEREST_TEMPLATE_ID),
@@ -1386,9 +1517,17 @@ def prepare_followup_for_interest(interest_id, customer_number, category, color,
 
 
 def notify_matching_interests(sku, product_name, doc_text):
+    """SECURITY (multi-tenant): same webhook context as embed_product_chunk —
+    no wa_number to resolve from, so workspace is queried via
+    resolve_sole_active_workspace() rather than hardcoded. Skips (rather
+    than guessing) once more than one active workspace exists."""
     category = detect_category(doc_text)
     color = detect_color(doc_text)
     if not category or not color:
+        return
+    workspace_id = resolve_sole_active_workspace()
+    if not workspace_id:
+        print("[PHASE3] notify_matching_interests skipped — workspace could not be uniquely resolved")
         return
     handle_match = [line for line in doc_text.split("\n") if line.startswith("Handle:")]
     product_handle = handle_match[0].split(":", 1)[1].strip() if handle_match else ""
@@ -1399,7 +1538,7 @@ def notify_matching_interests(sku, product_name, doc_text):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, customer_number FROM coexistence.customer_interests WHERE workspace_id = %s AND status = %s AND product_category = %s AND product_color = %s",
-                (1, "open", category, color),
+                (workspace_id, "open", category, color),
             )
             rows = cur.fetchall()
     except Exception as e:
@@ -1582,11 +1721,44 @@ def send_order_confirmation(order):
         conn.close()
 
 
+def resolve_sole_active_workspace():
+    """Shopify order webhooks carry no wa_number, so they can't be resolved
+    the same way /ai requests are. Per the audit, there is exactly one
+    active whatsapp_accounts row today (workspace_id=1) — this resolves that
+    by querying (not by hardcoding), and fails closed (None) the moment
+    there is more than one active workspace, at which point order-to-
+    workspace mapping needs a real signal (e.g. shopify_connections) before
+    it can be trusted. See "remaining risks" in the implementation report."""
+    conn = get_db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT workspace_id FROM coexistence.whatsapp_accounts WHERE is_active = true"
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"[TENANT] resolve_sole_active_workspace failed: {e}")
+        return None
+    finally:
+        conn.close()
+    if len(rows) != 1:
+        return None
+    return rows[0][0]
+
+
 def _sync_order_to_db(order):
     """PHASE 4: upserts a phone/email -> order_number mapping into our
     local table whenever Shopify sends an order webhook, so
     lookup_order_by_phone() can find orders without needing Shopify's
-    read_customers scope."""
+    read_customers scope.
+
+    SECURITY (multi-tenant): tags the row with workspace_id via
+    resolve_sole_active_workspace() (see above) instead of a hardcoded
+    value. Leaves workspace_id NULL — rather than guessing — the moment
+    more than one active workspace exists."""
+    workspace_id = resolve_sole_active_workspace()
     phone_raw = (
         order.get("phone")
         or (order.get("customer") or {}).get("phone")
@@ -1603,15 +1775,16 @@ def _sync_order_to_db(order):
             cur.execute(
                 """
                 INSERT INTO coexistence.shopify_orders
-                    (shopify_order_id, order_number, phone_digits, email, order_created_at)
-                VALUES (%s, %s, %s, %s, %s)
+                    (shopify_order_id, order_number, phone_digits, email, order_created_at, workspace_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (shopify_order_id) DO UPDATE SET
                     order_number = EXCLUDED.order_number,
                     phone_digits = EXCLUDED.phone_digits,
                     email = EXCLUDED.email,
+                    workspace_id = EXCLUDED.workspace_id,
                     synced_at = now()
                 """,
-                (order["id"], order.get("name", "").lstrip("#"), phone_digits, email, order.get("created_at")),
+                (order["id"], order.get("name", "").lstrip("#"), phone_digits, email, order.get("created_at"), workspace_id),
             )
         conn.commit()
         print(f"[PHASE4] Synced order #{order.get('name')} to local DB")
