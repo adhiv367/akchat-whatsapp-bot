@@ -273,9 +273,67 @@ Erode - 638107, Tamil Nadu, India
 For orders, just tell us the product SKU and your size 😊"""
 
 
-def load_products():
+def _load_products_raw():
+    """Unfiltered catalog file. ONLY for code that rewrites invi_products.json
+    (the Shopify webhooks): they must never save a filtered list back."""
     with open("invi_products.json", "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# TEST_PRODUCT_FILTER -- test products must never be shown to customers or used to
+# notify them. A product is a test product when it has the exact tag "test" or a SKU
+# starting with TESTSKU.
+_TEST_SKU_PREFIX = "TESTSKU"
+
+
+def is_test_product_text(text):
+    """True when a product document is a test product: it carries the exact tag
+    "test" (comma separated, any case; "latest" or "contest" do not match) or has
+    a SKU starting with TESTSKU."""
+    for line in (text or "").split("\n"):
+        low = line.strip().lower()
+        if low.startswith("tags:"):
+            if "test" in [t.strip() for t in low[5:].split(",")]:
+                return True
+        elif low.startswith("sku:") or low.startswith("all skus:"):
+            for s in line.split(":", 1)[1].split(","):
+                if s.strip().upper().startswith(_TEST_SKU_PREFIX):
+                    return True
+    return False
+
+
+def load_products():
+    """Catalog for everything customer-facing: test products are removed."""
+    return [p for p in _load_products_raw() if not is_test_product_text(p.get("text", ""))]
+
+
+def _skus_in_text(text):
+    """SKUs named on the 'SKU:' / 'All SKUs:' lines of a product document, upper-cased."""
+    out = set()
+    for line in (text or "").split("\n"):
+        low = line.strip().lower()
+        if low.startswith("sku:") or low.startswith("all skus:"):
+            for s in line.split(":", 1)[1].split(","):
+                if s.strip():
+                    out.add(s.strip().upper())
+    return out
+
+
+def _catalog_test_skus():
+    """STEP1C: SKUs the catalog file marks as test products. Used to drop stale knowledge
+    chunks of a product that was tagged 'test' after it had already been embedded.
+    Empty set when the catalog cannot be read (the text filter still applies)."""
+    try:
+        skus = set()
+        for p in _load_products_raw():
+            t = p.get("text", "")
+            if is_test_product_text(t):
+                skus |= _skus_in_text(t)
+        return skus
+    except Exception:
+        return set()
+
+
 def save_products(products):
     with open("invi_products.json", "w", encoding="utf-8") as f:
         json.dump(products, f, ensure_ascii=False, indent=2)
@@ -409,14 +467,46 @@ def semantic_search_products(query, top_k=3, workspace_id=None):
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
-                (workspace_id, vector_literal, top_k),
+                (workspace_id, vector_literal, top_k + 10),  # STEP1B over-fetch
             )
-            return [row[0] for row in cur.fetchall()]
+            blocked = _catalog_test_skus()  # STEP1C
+            return [row[0] for row in cur.fetchall()
+                    if not is_test_product_text(row[0])
+                    and not (blocked & _skus_in_text(row[0]))][:top_k]  # STEP1B
     except Exception as e:
         print(f"[PHASE1] semantic_search_products failed: {e}")
         return []
     finally:
         conn.close()
+
+def find_product_text_in_db(sku, workspace_id):
+    """SKU fallback: the product's knowledge-chunk text when the JSON catalog lacks it.
+    Read-only. Returns {"text": ...} or None. Never raises."""
+    if not sku or not workspace_id:
+        return None
+    conn = get_db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT kc.chunk_text FROM coexistence.knowledge_chunks kc
+                JOIN coexistence.knowledge_documents kd ON kd.id = kc.document_id
+                WHERE kd.source_type = 'product' AND kc.workspace_id = %s
+                  AND kc.chunk_text ILIKE %s
+                LIMIT 20
+                """,
+                (workspace_id, "%" + sku + "%"),
+            )
+            for (text,) in cur.fetchall():
+                if sku.upper() in _skus_in_text(text) and not is_test_product_text(text):
+                    return {"text": text}
+    except Exception as e:
+        print(f"[SKU-DB] lookup failed: {e}")
+    finally:
+        conn.close()
+    return None
 
 def embed_text(text):
     """PHASE 1: embeds text using gemini-embedding-001 (3072 dims), then
@@ -493,6 +583,9 @@ def embed_product_chunk(handle, sku, text):
     resolve_sole_active_workspace() (queried, not hardcoded) instead of a
     literal workspace_id. Skips the embed entirely — rather than guessing —
     the moment more than one active workspace exists."""
+    if is_test_product_text(text):
+        print("[TEST-FILTER] embed_product_chunk skipped for a test product")
+        return
     workspace_id = resolve_sole_active_workspace()
     if not workspace_id:
         print("[PHASE1] embed_product_chunk skipped — workspace could not be uniquely resolved")
@@ -540,6 +633,7 @@ def embed_product_chunk(handle, sku, text):
 
 def get_top_product_images(query, products, top_k=5):
     """Return list of matching products with sku, name, and image for suggestion replies"""
+    products = [p for p in products if not is_test_product_text(p.get("text", ""))]  # STEP5
     query_words = set(query.lower().split())
     scores = []
     for p in products:
@@ -718,9 +812,9 @@ def check_stock_claims(reply, products):
     status, and checks whether the reply's wording contradicts it — e.g.
     claiming something is available when the real data says Out of Stock."""
     reply_lower = reply.lower()
-    sku_matches = re.findall(r'\b(ICK\d+|ICS\d+|ICC\d+)\b', reply, re.IGNORECASE)
+    sku_matches = re.findall(r'\b(IC[A-Z]\d+)\b', reply, re.IGNORECASE)
     for sku in set(m.upper() for m in sku_matches):
-        product = find_product_by_sku(sku, products)
+        product = find_product_by_sku(sku, products) 
         if not product:
             continue
         details = parse_product_details(product)
@@ -914,6 +1008,77 @@ def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer
     lines.append("Reply with the SKU and your size to order! 😊")
     reply_text = "\n".join(lines)
     return reply_text, images[0]["image"] if images else None, images
+# STEP6_NEW_ARRIVALS -- grounded "new arrivals". Only products with the exact tag
+# "temp-new" that are in stock and are not test products. Order = the order stored in
+# invi_products.json (newest first). Nothing is invented; with no match the customer is told so.
+NEW_ARRIVAL_TAG = "temp-new"
+NEW_ARRIVALS_MAX = 5
+NEW_ARRIVALS_NONE_REPLY = ("I don't have new arrival details right now. You can check "
+                           "https://www.invicreation.com or call 9751100905 \U0001F60A")
+_NEW_ARRIVALS_PATTERNS = [
+    re.compile(r"\bnew\s+arrivals?\b"),
+    re.compile(r"\b(?:latest|newest|new)\s+(?:collections?|designs?|stock|models?|styles?|dress(?:es)?|kurthis?|kurtis?|kurtas?|salwars?|suits?|sets?|maxis?|co-?ords?)\b"),
+    re.compile(r"\bwhat(?:['\u2019]?s| is)\s+new\b"),
+    re.compile(r"\bjust\s+(?:arrived|launched)\b"),
+]
+
+
+def is_new_arrivals_query(message):
+    """True only for a clear 'show me what is new' request. SKU messages, order,
+    policy and offer/discount questions are left to the other routes."""
+    text = re.sub(r"\s+", " ", (message or "").lower()).strip()
+    if not text or len(text) > 120:
+        return False
+    if re.search(r"\b(IC[A-Z]\d+)\b", message, re.IGNORECASE):
+        return False
+    if _looks_like_order_query(text) or any(kw in text for kw in POLICY_KEYWORDS):
+        return False
+    if re.search(r"\b(?:offers?|discounts?|sale|coupons?|deals?)\b", text):
+        return False
+    return any(p.search(text) for p in _NEW_ARRIVALS_PATTERNS)
+
+
+def new_arrival_products(query="", exclude_skus=None, limit=NEW_ARRIVALS_MAX):
+    """Product texts for the new-arrivals reply. A category word in the query
+    (kurthi / salwar / maxi / co-ord) narrows the list by the product's Type and
+    name; the tag line is never used to decide the category."""
+    category = detect_category(query or "")
+    if not category and re.search(r"\bsuits?\b", (query or "").lower()):
+        category = "salwar"
+    exclude = set(exclude_skus or [])
+    fresh, shown = [], []
+    for p in load_products():
+        details = parse_product_details(p)
+        tags = [t.strip().lower() for t in details.get("Tags", "").split(",")]
+        if NEW_ARRIVAL_TAG not in tags:
+            continue
+        if details.get("Status", "").strip().lower() != "available":
+            continue
+        if category:
+            hay = (details.get("Type", "") + " " + details.get("Product", "")).lower()
+            if not any(w in hay for w in CATEGORY_WORDS_MATCH[category]):
+                continue
+        (shown if details.get("SKU", "") in exclude else fresh).append(p["text"])
+    return (fresh + shown)[:limit]
+
+
+def build_new_arrivals_reply(product_texts):
+    """Same card layout as build_suggestion_reply, but only for the given products."""
+    lines = ["Here are our latest arrivals \U0001F483:\n"]
+    images = []
+    for i, text in enumerate(product_texts, 1):
+        details = parse_product_details({"text": text})
+        name = details.get("Product", "").split("-PI")[0].strip()
+        sku = details.get("SKU", "")
+        handle = details.get("Handle", "")
+        link = f"https://www.invicreation.com/products/{handle}" if handle else "https://www.invicreation.com"
+        lines.append(f"{i}. \U0001F457 *{name}*\n\U0001F3F7\uFE0F SKU: {sku}\n\U0001F4B0 Price: {details.get('Price', '')}\n\U0001F4CF Sizes: {details.get('Available Sizes', '').upper()}\n\U0001F517 View & Order: {link}\n")
+        if details.get("Image"):
+            images.append({"sku": sku, "name": name, "image": details["Image"]})
+    lines.append("Reply with the SKU and your size to order! \U0001F60A")
+    return "\n".join(lines), (images[0]["image"] if images else None), images
+
+
 def build_collection_overview_reply(products):
     """Warm intro + one representative product per category"""
     intro = ("Hi! 👋 Welcome to *Invi Creation* — your go-to boutique for pure cotton women's wear.\n\n"
@@ -960,7 +1125,47 @@ def build_collection_overview_reply(products):
 # in the prompt when present. Callers that don't pass it (there are none
 # currently, but this keeps the function backward-compatible) behave exactly
 # as before.
-def ask_groq(query, context, conversation_history=None, policy_context=None):
+def clean_history_for_prompt(history, current_message=None, max_chars=400):
+    """Turns saved (direction, text) rows into a tidy transcript for the AI:
+    "Customer: ..." / "Shop: ...", oldest first. Drops the current message
+    (it is logged before the AI runs, so it would appear twice), shortens very
+    long shop replies (product lists) and skips the temporary error fallback.
+    Returns "" when there is nothing to show."""
+    if not history:
+        return ""
+    rows = list(history)
+    if current_message and rows and rows[-1][0] == "incoming" \
+            and (rows[-1][1] or "").strip() == current_message.strip():
+        rows = rows[:-1]
+    lines = []
+    for direction, text in rows:
+        text = " ".join((text or "").split())
+        if not text:
+            continue
+        if direction == "incoming":
+            speaker = "Customer"
+        else:
+            if text.startswith("Sorry, I'm having trouble"):
+                continue
+            speaker = "Shop"
+            if len(text) > max_chars:
+                text = text[:max_chars].rstrip() + " ..."
+        lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+# -- Closing-line gate (FOLLOWUP_ALERTS_PATCH) --
+# "Reply with the SKU and your size to order!" is only added when the customer is
+# genuinely showing buying / product interest, never on every reply.
+BUYING_INTENTS = {"PURCHASE_INTENT", "HOT_LEAD", "WARM_LEAD", "PRODUCT_INTEREST"}
+_MEMORY_QUESTION = re.compile(r"\b(did|do) i (say|tell|mention)\b|\bwhat i (said|told)\b", re.IGNORECASE)
+
+
+def _is_memory_question(message):
+    return bool(_MEMORY_QUESTION.search(message or ""))
+
+
+def ask_groq(query, context, conversation_history=None, policy_context=None, show_closing_line=False, followup_note=None):
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -970,14 +1175,16 @@ def ask_groq(query, context, conversation_history=None, policy_context=None):
     policy_block = ""
     if policy_context:
         policy_block = "Relevant store policy/FAQ info:\n" + "\n---\n".join(policy_context) + "\n\n"
-    history_block = ""
-    if conversation_history:
-        lines = []
-        for direction, text in conversation_history:
-            speaker = "Customer" if direction == "incoming" else "You"
-            lines.append(f"{speaker}: {text}")
-        history_block = "Recent conversation with this customer:\n" + "\n".join(lines) + "\n\n"
+    _clean_history = clean_history_for_prompt(conversation_history, query)
+    history_block = ("Recent conversation with this customer:\n" + _clean_history + "\n\n") if _clean_history else ""
+    if followup_note:
+        history_block += ("Known plan from this customer: " + followup_note + " If it fits what they are asking, you may naturally acknowledge it (for example: You mentioned you were planning to buy this dress next Friday). Do not bring it up if they are asking about something unrelated.\n\n")
 
+    closing_rule = (
+        "- End with: Reply with the SKU and your size to order! \U0001F60A"
+        if show_closing_line else
+        "- Do NOT add any order / SKU / size call-to-action at the end; just answer the question."
+    )
     prompt = f"""You are a WhatsApp shopping assistant for Invi Creation, a women's boutique.
 Website: https://www.invicreation.com
 Phone: 9751100905
@@ -989,6 +1196,7 @@ Customer Message: {query}
 
 Instructions:
 - Reply friendly and short like a boutique staff on WhatsApp
+- If the customer asks what they said earlier (for example "what did I say I would buy?" or "when did I say I would buy it?"), answer ONLY from the Customer lines in the recent conversation, in their own words, including any date or time they gave (for example: You mentioned you'd like to buy it next Friday). Use one or two short sentences, do not add prices, SKUs or product lists, ignore Relevant Products, and skip the closing line. If they never said it, say you don't see that in the chat and ask what they'd like to buy.
 - If customer says hi or hello, greet them and introduce Invi Creation
 - If the recent conversation above answers part of the question (e.g. a price or product already mentioned), use it exactly as stated there — don't substitute a different product from "Relevant Products" below, even if it seems similar
 - If customer asks to suggest, show, or recommend dresses — show 5 products like this format EXACTLY:
@@ -1005,8 +1213,9 @@ Instructions:
 - If customer gives a SKU like ICK00133, show ONLY that product details
 - Always use the exact Handle from product data for the View & Order link
 - Never make up products not in the context
+- (NO_INVENT_PATCH) Never mention, promise or guess discounts, offers, sales, coupons, festival deals or new arrivals unless that exact information is written in the product data above. If the customer asks about them and it is not there, say you do not have current offer or new-arrival details, and suggest checking https://www.invicreation.com or calling 9751100905. Do not invent prices, percentages or dates.
 - Reply in same language as customer (Tamil or English)
-- End with: Reply with the SKU and your size to order! 😊
+{closing_rule}
 
 Answer:"""
 
@@ -1064,6 +1273,21 @@ def score_to_label(score):
     return "JUST_BROWSING"
 
 
+# Clear "I'm not buying" phrases. Only checked when the message itself has no
+# buying signal (JUST_BROWSING). Add more Tamil/Tanglish phrases here any time.
+DISINTEREST_PHRASES = [
+    "not interested", "no thanks", "no thank you", "dont want", "don't want",
+    "do not want", "changed my mind", "change my mind", "not buying",
+    "won't buy", "wont buy", "will not buy",
+    "vendam", "venaam", "pidikala", "pidikkala", "interest illa",
+]
+
+
+def is_disinterest(message):
+    msg_lower = (message or "").lower()
+    return any(p in msg_lower for p in DISINTEREST_PHRASES)
+
+
 def update_customer_score(workspace_id, wa_number, contact_number, message, detected_intent, signal_score, confidence):
     """Blends this message's signal with the customer's existing score, so
     one message doesn't wildly swing their classification, while repeated
@@ -1093,9 +1317,20 @@ def update_customer_score(workspace_id, wa_number, contact_number, message, dete
             if detected_intent in ("SUPPORT", "EXISTING_CUSTOMER"):
                 new_score = old_score
                 new_intent = detected_intent
+            elif detected_intent == "JUST_BROWSING":
+                # Neutral message: hold the score. Only a clear disinterest
+                # phrase lowers it.
+                if is_disinterest(message):
+                    new_score = max(0, old_score - 25)
+                else:
+                    new_score = old_score
+                new_intent = score_to_label(new_score)
             else:
+                # Real buying signal: blend as before, but never fall below
+                # the customer's existing score.
                 effective_signal = signal_score if signal_score is not None else 10
-                new_score = max(0, min(100, round(0.6 * effective_signal + 0.4 * old_score)))
+                blended = max(0, min(100, round(0.6 * effective_signal + 0.4 * old_score)))
+                new_score = max(old_score, blended)
                 new_intent = score_to_label(new_score)
 
             cur.execute(
@@ -1134,7 +1369,7 @@ def update_customer_score(workspace_id, wa_number, contact_number, message, dete
 
 
 def build_intent_prompt(message, conversation_history=None):
-    history_text = conversation_history if conversation_history else "(no prior messages)"
+    history_text = clean_history_for_prompt(conversation_history, message) or "(no prior messages)"
     return f"""You are an intent classifier for a WhatsApp shopping assistant selling women's
 ethnic wear (kurthis, kurthi sets, salwar sets) in Tamil Nadu, India. Customers
 write in Tamil, Tanglish (Tamil in English letters), English, or a mix — often
@@ -1272,6 +1507,462 @@ def classify_intent_smart(message, customer_id=None, workspace_id=None, wa_numbe
 
 
 
+# SALES_AGENT_PATCH -- HUMAN SALES AGENT (optional).
+# Everything below is OFF unless the Render variable SALES_AGENT_ENABLED is "true".
+def _sales_agent_enabled():
+    return os.environ.get("SALES_AGENT_ENABLED", "false").strip().lower() == "true"
+
+
+def _try_sales_agent(message, customer_id, workspace_id, wa_number):
+    """Returns the Human Sales Agent's answer (a dict), or None when the agent is
+    off, has nothing to say, or hits ANY error. None means: /ai carries on with
+    the old code below, exactly as before."""
+    if not _sales_agent_enabled():
+        return None
+    try:
+        import sys
+        # tools/*.py do "from ai_bridge_phase2 import ...": make sure that reuses THIS
+        # already-loaded module instead of loading a second copy.
+        sys.modules.setdefault("ai_bridge_phase2", sys.modules[__name__])
+        agent_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_sales_agent")
+        if agent_dir not in sys.path:
+            sys.path.insert(0, agent_dir)
+        import sales_agent
+        return sales_agent.run(message, customer_id, workspace_id, wa_number)
+    except Exception as e:
+        print(f"[SALES-AGENT] error, falling back to the old logic: {e}")
+        return None
+
+
+# HANDOFF_PATCH -- Human-handoff detection for staff alerts (Node sends the alerts).
+# Off unless the Render variable HANDOFF_ALERTS_ENABLED is "true".
+#
+# WHO DECIDES
+#   * If the Human Sales Agent handled the message, ITS decision (handoff_required
+#     true/false, already checked against the explicit "talk to a person" phrases) is kept.
+#   * Otherwise (Sales Agent off, or it fell back to the old code) the NARROW rules below
+#     decide. They only fire on a clear request for a person, or a clear first-person
+#     complaint - never on plain product questions and never on policy questions such as
+#     "what is your refund policy?".
+HANDOFF_ACK_REPLY_EN = "Sure - I've let our team know. A team member will get back to you shortly \U0001F60A"
+HANDOFF_ACK_REPLY_TA = "\u0b9a\u0bb0\u0bbf, \u0b8e\u0b99\u0bcd\u0b95\u0bb3\u0bcd \u0b95\u0bc1\u0bb4\u0bc1\u0bb5\u0bc1\u0b95\u0bcd\u0b95\u0bc1\u0ba4\u0bcd \u0ba4\u0bc6\u0bb0\u0bbf\u0bb5\u0bbf\u0ba4\u0bcd\u0ba4\u0bc1\u0bb5\u0bbf\u0b9f\u0bcd\u0b9f\u0bc7\u0ba9\u0bcd. \u0bb5\u0bbf\u0bb0\u0bc8\u0bb5\u0bbf\u0bb2\u0bcd \u0b92\u0bb0\u0bc1\u0bb5\u0bb0\u0bcd \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc8\u0ba4\u0bcd \u0ba4\u0bca\u0b9f\u0bb0\u0bcd\u0baa\u0bc1 \u0b95\u0bca\u0bb3\u0bcd\u0bb5\u0bbe\u0bb0\u0bcd \U0001F60A"
+
+_HUMAN_REQUEST_PATTERNS = [
+    # talk / speak / chat / connect ... a person, agent, team, manager, customer care
+    re.compile(r"\b(talk|speak|chat|connect|transfer)\b.{0,25}\b(real person|human|person|someone|somebody|agent|representative|staff|team|manager|owner|customer care|customer support|support)\b"),
+    re.compile(r"\b(real|live|human)\s+(person|agent|human|representative)\b"),
+    re.compile(r"\bcall me\b|\bgive me a call\b|\bplease call\b"),
+]
+_COMPLAINT_PATTERNS = [
+    re.compile(r"\b(i|we)\s+(want|need|would like)\s+(?:a\s+|my\s+|the\s+|full\s+)*(refund|money back)\b"),
+    re.compile(r"\brefund me\b|\bgive me (?:a )?refund\b|\bgive (?:me )?my money back\b|\breturn my money\b"),
+    re.compile(r"\b(received|got|recieved|delivered|sent me|sent us|came|arrived)\b[^.?!]{0,40}\b(damaged|torn|defective|broken|stained|wrong|different)\b"),
+    re.compile(r"\b(arrived|came|reached)\s+(damaged|torn|defective|broken|stained)\b"),
+    re.compile(r"\b(is|was|are|were)\s+(damaged|torn|defective|broken|stained)\b"),
+    re.compile(r"\b(i|we) (have|want to make|want to raise|want to file|need to make) (a )?complaint\b|\bi want to complain\b|\bthis is a complaint\b|\b(raise|file|make) a complaint\b"),
+]
+# Questions / "what if" wording = the customer is asking about a policy, not complaining.
+_HYPOTHETICAL = re.compile(r"\b(if|in case|what happens|what if|policy|policies|how do i|how can i|can i|could i|do you|does it|is it)\b")
+
+
+# Extra serious-message rules (angry tone, bad quality, payment and delivery problems).
+# Same safety idea as the rules above: policy questions ("if", "can i", "do you"...) never count.
+_EXTRA_SERIOUS_PATTERNS = [
+    ("Angry or harsh message", re.compile(r"\b(worst|pathetic|useless|horrible|terrible|disgusting|cheated|cheating|cheaters?|fraud|scam|rubbish|nonsense|stupid|idiots?|fools?|mosam|mokka)\b")),
+    ("Product quality complaint", re.compile(r"\b(?:dress|product|item|material|fabric|quality|kurti|kurthi|saree|service)\b[^.?!]{0,30}\b(?:very bad|so bad|too bad|really bad|worst|poor|cheap quality|not good|waste)\b")),
+    ("Product quality complaint", re.compile(r"\b(?:very bad|so bad|too bad|really bad|worst)\b[^.?!]{0,30}\b(?:dress|product|item|material|fabric|quality|service)\b")),
+    ("Payment issue", re.compile(r"\b(?:payment|paid|money|amount)\b[^.?!]{0,40}\b(?:deducted|debited|failed|not (?:received|refunded|updated)|stuck|pending|double|twice)\b")),
+    ("Payment issue", re.compile(r"\b(?:deducted|debited|charged)\b[^.?!]{0,30}\b(?:twice|double)\b")),
+    ("Serious delivery issue", re.compile(r"\b(?:order|parcel|package|dress|delivery)\b[^.?!]{0,40}\b(?:not (?:received|delivered|arrived)|never (?:came|arrived|received)|missing|lost)\b")),
+    ("Serious delivery issue", re.compile(r"\b(?:i|we)\s+(?:have\s+not|haven't|did\s+not|didn't|never)\s+(?:received|receive|got)\b")),
+]
+
+
+def _extra_serious_reason(text):
+    if not text or _HYPOTHETICAL.search(text):
+        return None
+    for reason, pattern in _EXTRA_SERIOUS_PATTERNS:
+        if pattern.search(text):
+            return reason
+    return None
+
+
+def _handoff_meta(message, reason):
+    """(category, priority) for the AI Alerts tab. Everything rule-detected is 'high'
+    so staff WhatsApp behaviour is unchanged; unknown reasons stay 'high' too."""
+    r = (reason or "").lower()
+    if "human" in r:
+        return "Human request", "high"
+    if "payment" in r:
+        return "Payment issue", "high"
+    if "delivery" in r:
+        return "Delivery issue", "high"
+    if "angry" in r or "harsh" in r:
+        return "Angry customer", "high"
+    if "quality" in r:
+        return "Product complaint", "high"
+    if "refund" in r or "complaint" in r or "damaged" in r:
+        return "Complaint", "high"
+    return "General", "high"
+
+
+def _handoff_alerts_enabled():
+    return os.environ.get("HANDOFF_ALERTS_ENABLED", "false").strip().lower() == "true"
+
+
+def _handoff_reason_from_text(message):
+    text = re.sub(r"\s+", " ", (message or "").lower()).strip()
+    if not text:
+        return None
+    _extra = _extra_serious_reason(text)
+    if _extra:
+        return _extra
+    for p in _HUMAN_REQUEST_PATTERNS:
+        if p.search(text):
+            return "Customer asked for a human"
+    if not _HYPOTHETICAL.search(text):
+        for p in _COMPLAINT_PATTERNS:
+            if p.search(text):
+                return "Customer complaint (damaged/wrong item, refund or complaint)"
+    return None
+
+
+# STEP8A_LOW_ALERT -- LOW priority (dashboard-only) alert: the customer sent the SAME message
+# LOW_ALERT_REPEAT_COUNT times within LOW_ALERT_WINDOW_MINUTES. Off unless BOTH
+# HANDOFF_ALERTS_ENABLED and LOW_ALERTS_ENABLED are "true". It never changes the customer's
+# reply, never overrides a HIGH alert, and Node stores LOW alerts without messaging staff.
+LOW_ALERT_REPEAT_COUNT = 3
+LOW_ALERT_WINDOW_MINUTES = 30
+_LOW_PUNCT = re.compile(r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~\u2018\u2019\u201c\u201d\u2026]+")
+
+
+def _low_alerts_enabled():
+    return os.environ.get("LOW_ALERTS_ENABLED", "false").strip().lower() == "true"
+
+
+def _normalize_for_repeat(text):
+    t = _LOW_PUNCT.sub(" ", (text or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _low_alert_check(payload):
+    """{"reason", "category"} when this message is exactly the Nth identical incoming message
+    of this customer inside the window, else None. Never raises."""
+    try:
+        message = str(payload.get("message") or "")
+        customer_id = payload.get("customer_id") or ""
+        wa_number = payload.get("wa_number") or ""
+        if not message or not customer_id or payload.get("button_click") or message.startswith("ID::"):
+            return None
+        target = _normalize_for_repeat(message)
+        # one-word messages and greetings ("hi", "ok", "thanks") repeat all the time and mean nothing
+        if len(target.split()) < 2 or target in QUICK_REPLIES:
+            return None
+        workspace_id = resolve_workspace_id(wa_number)
+        if not workspace_id:
+            return None
+        conn = get_db_conn()
+        if not conn:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT message_text FROM coexistence.conversation_messages
+                     WHERE customer_id = %s AND workspace_id = %s AND wa_number = %s
+                       AND direction = 'incoming'
+                       AND created_at > NOW() - (%s * INTERVAL '1 minute')
+                     ORDER BY created_at DESC
+                     LIMIT 12
+                    """,
+                    (customer_id, workspace_id, wa_number, LOW_ALERT_WINDOW_MINUTES),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        # the current message is already logged by /ai, so it is counted here
+        same = sum(1 for (t,) in rows if _normalize_for_repeat(t) == target)
+        if same == LOW_ALERT_REPEAT_COUNT:
+            return {
+                "reason": "Customer sent the same message %d times within %d minutes"
+                          % (LOW_ALERT_REPEAT_COUNT, LOW_ALERT_WINDOW_MINUTES),
+                "category": "Repeated question",
+            }
+    except Exception as e:
+        print(f"[LOW-ALERT] check skipped: {e}")
+    return None
+
+
+@app.after_request
+def _attach_handoff_fields(response):
+    """Only touches successful /ai responses. Never raises: on any problem the
+    original response is returned unchanged."""
+    try:
+        if request.path != "/ai" or response.status_code != 200 or not response.is_json:
+            return response
+        data = json.loads(response.get_data(as_text=True))
+        if not isinstance(data, dict):
+            return response
+        changed = False
+        if not _handoff_alerts_enabled():
+            # switch OFF: tell Node nothing about handoffs
+            for k in ("handoff_required", "handoff_reason"):
+                if k in data:
+                    data.pop(k)
+                    changed = True
+        elif data.get("handoff_required") is True and not data.get("handoff_priority"):
+            _msg = str((request.get_json(silent=True) or {}).get("message") or "")
+            data["handoff_category"], data["handoff_priority"] = _handoff_meta(_msg, data.get("handoff_reason"))
+            changed = True
+        elif "handoff_required" not in data:
+            # the Sales Agent did not decide -> the narrow rules do
+            message = str((request.get_json(silent=True) or {}).get("message") or "")
+            reason = _handoff_reason_from_text(message)
+            if reason:
+                is_tamil = any("\u0b80" <= ch <= "\u0bff" for ch in message)
+                data["handoff_required"] = True
+                data["handoff_reason"] = reason
+                data["handoff_category"], data["handoff_priority"] = _handoff_meta(message, reason)
+                # an alert with an unrelated customer reply would be confusing, so the
+                # customer gets a short acknowledgement instead (no cards / buttons)
+                data["reply"] = HANDOFF_ACK_REPLY_TA if is_tamil else HANDOFF_ACK_REPLY_EN
+                data["type"] = "text"
+                data["image"] = None
+                for k in ("images", "cards", "intro", "buttons"):
+                    data.pop(k, None)
+                changed = True
+        # STEP8A_LOW_ALERT: only when no HIGH alert is already set; the reply is never touched
+        if _handoff_alerts_enabled() and _low_alerts_enabled() and data.get("handoff_required") is not True:
+            _low = _low_alert_check(request.get_json(silent=True) or {})
+            if _low:
+                data["handoff_required"] = True
+                data["handoff_reason"] = _low["reason"]
+                data["handoff_category"] = _low["category"]
+                data["handoff_priority"] = "low"
+                changed = True
+        if changed:
+            response.set_data(json.dumps(data))
+        return response
+    except Exception as e:
+        print(f"[HANDOFF] after_request skipped: {e}")
+        return response
+
+
+# FOLLOWUP_AGENT -- saves "I'll buy next week" promises (off unless FOLLOWUP_AGENT_ENABLED=true).
+try:
+    import followup_agent as _fa
+except Exception as _fa_err:
+    _fa = None
+    print(f"[FOLLOWUP] module not loaded: {_fa_err}")
+
+
+def _unambiguous_recent_sku(customer_id, workspace_id, wa_number, window_seconds=5):
+    """Returns [sku] only when the customer's most recently shown batch of products
+    is a single product; otherwise [] (e.g. 5 suggestions shown = we cannot know
+    which one "this dress" means). Never raises."""
+    if not customer_id:
+        return []
+    conn = get_db_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT sku, shown_at FROM coexistence.shown_products
+                 WHERE customer_id = %s AND workspace_id = %s AND wa_number = %s
+                 ORDER BY shown_at DESC
+                 LIMIT 10
+                """,
+                (customer_id, workspace_id, wa_number),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return []
+        newest = rows[0][1]
+        batch = {str(s).upper() for s, t in rows if (newest - t).total_seconds() <= window_seconds}
+        return [next(iter(batch))] if len(batch) == 1 else []
+    except Exception as e:
+        print(f"[FOLLOWUP] recent sku lookup skipped: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _followup_product(message, customer_id, workspace_id, wa_number):
+    m = re.search(r"\b(IC[A-Z]\d+)\b", message or "", re.IGNORECASE)
+    sku = m.group(1).upper() if m else None
+    if not sku:
+        recent = _unambiguous_recent_sku(customer_id, workspace_id, wa_number)
+        if recent:
+            sku = str(recent[0]).upper()
+    name = None
+    if sku:
+        product = find_product_by_sku(sku, load_products())
+        if product:
+            name = parse_product_details(product).get("Product") or None
+    return sku, name
+
+
+def _maybe_capture_followup(message, customer_id, workspace_id, wa_number):
+    try:
+        if _fa is None or not _fa.enabled():
+            return
+        _fa.capture_in_background(
+            get_db_conn, workspace_id, wa_number, customer_id, message,
+            resolve_product=lambda msg: _followup_product(msg, customer_id, workspace_id, wa_number),
+        )
+    except Exception as e:
+        print(f"[FOLLOWUP] capture skipped: {e}")
+
+
+def _pending_followup_note(customer_id, workspace_id, wa_number):
+    """One short sentence about this customer's newest pending follow-up (or None)."""
+    try:
+        if _fa is None or not _fa.enabled():
+            return None
+        conn = get_db_conn()
+        if not conn:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT product_name, product_sku, followup_text, due_date
+                      FROM coexistence.customer_followups
+                     WHERE workspace_id = %s AND wa_number = %s AND contact_number = %s
+                       AND status = 'pending'
+                     ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (workspace_id, wa_number, customer_id),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        name, sku, text, due = row
+        what = name or sku or "an item"
+        when = text or "later"
+        if due:
+            when += " (around " + due.strftime("%d %b %Y") + ")"
+        return "The customer said they plan to buy " + what + " " + when + "."
+    except Exception as e:
+        print(f"[FOLLOWUP] note skipped: {e}")
+        return None
+
+
+# BUDGET_PATCH -- price-budget questions ("kurthi under 1000") answered from the real
+# catalog prices. No Groq, nothing invented. Runs BEFORE the order-number lookup, because
+# extract_order_number() treats any 3-5 digit number in a message as an order number.
+_CUR = r"(?:rs\.?|inr|\u20b9)?\s*"
+_N = r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(\s*k\b)?"
+_BUDGET_RANGE = re.compile(r"\b(?:between\s+)?" + _CUR + _N + r"\s*(?:-|to|and)\s*" + _CUR + _N, re.IGNORECASE)
+_BUDGET_UPPER_PRE = re.compile(r"\b(?:under|below|less than|within|upto|up to|max(?:imum)?|not more than|no more than|budget(?: is| of| max| maximum)?)\s*[:\-]?\s*" + _CUR + _N, re.IGNORECASE)
+_BUDGET_UPPER_POST = re.compile(_N + r"\s*(?:rs\.?|rupees|/-)?\s*(?:kulla|kulle|below|or less|or below|or under)\b", re.IGNORECASE)
+_BUDGET_LOWER = re.compile(r"\b(?:above|over|more than|at least|minimum|starting from)\s*" + _CUR + _N, re.IGNORECASE)
+_BUDGET_MIN_AMOUNT, _BUDGET_MAX_AMOUNT = 300, 20000
+
+
+def _budget_amount(num, k):
+    value = float(num.replace(",", ""))
+    if k:
+        value *= 1000
+    return value if _BUDGET_MIN_AMOUNT <= value <= _BUDGET_MAX_AMOUNT else None
+
+
+def _parse_budget(message):
+    """{"min": x or None, "max": y or None} when the message states a price budget or
+    range, else None. Bare numbers (order numbers, phone numbers, years) never count."""
+    text = (message or "").lower()
+    m = _BUDGET_RANGE.search(text)
+    if m:
+        cue = "between" in m.group(0) or re.search(r"rs\.?|inr|\u20b9|budget|price|rate|rupee", text)
+        a, b = _budget_amount(m.group(1), m.group(2)), _budget_amount(m.group(3), m.group(4))
+        if cue and a is not None and b is not None:
+            return {"min": min(a, b), "max": max(a, b)}
+    lo = hi = None
+    m = _BUDGET_UPPER_PRE.search(text) or _BUDGET_UPPER_POST.search(text)
+    if m:
+        hi = _budget_amount(m.group(1), m.group(2))
+    m = _BUDGET_LOWER.search(text)
+    if m:
+        lo = _budget_amount(m.group(1), m.group(2))
+    if lo is None and hi is None:
+        return None
+    if lo is not None and hi is not None and lo > hi:
+        return None
+    return {"min": lo, "max": hi}
+
+
+def _mentions_budget_word(text):
+    return bool(re.search(r"\bbudget\b", text or "", re.IGNORECASE))
+
+
+def _looks_like_order_query(text):
+    text = text or ""
+    return any(kw in text for kw in ORDER_STATUS_KEYWORDS) or bool(
+        re.search(r"\border\s*(?:id|no\.?|number|#)|#\s*\d", text))
+
+
+def _price_of(details):
+    m = re.search(r"(\d[\d,]*\.?\d*)", details.get("Price", "") or "")
+    return float(m.group(1).replace(",", "")) if m else None
+
+
+def _budget_text(budget):
+    lo, hi = budget.get("min"), budget.get("max")
+    if lo is not None and hi is not None:
+        return "between Rs.%d and Rs.%d" % (lo, hi)
+    if hi is not None:
+        return "under Rs.%d" % hi
+    return "above Rs.%d" % lo
+
+
+def build_budget_reply(message, products, budget, exclude_skus=None, customer_id=None, workspace_id=None):
+    """Same return shape as build_suggestion_reply: (reply, top_image, image_list).
+    Only real, published, in-stock products with an image whose Shopify price fits."""
+    lo, hi = budget.get("min"), budget.get("max")
+    msg = (message or "").lower()
+    category = None
+    for name, words in CATEGORY_WORDS_MATCH.items():
+        if any(w in msg for w in words):
+            category = name
+            break
+    pool, in_stock_prices = [], []
+    for p in products:
+        d = parse_product_details(p)
+        price = _price_of(d)
+        if price is None or d.get("Status", "") == "Out of Stock" or not d.get("Image"):
+            continue
+        if category and not any(w in p["text"].lower() for w in CATEGORY_WORDS_MATCH[category]):
+            continue
+        in_stock_prices.append(price)
+        if (lo is not None and price < lo) or (hi is not None and price > hi):
+            continue
+        pool.append((price, p))
+    what = {"kurthi": "kurthis", "salwar": "salwar sets", "maxi": "maxi dresses", "co-ord": "co-ord sets"}.get(category, "products")
+    if not pool:
+        if in_stock_prices:
+            return ("Sorry, I couldn't find any in-stock %s %s right now. Our in-stock %s are between Rs.%d and Rs.%d - "
+                    "would you like to see options in that range? \U0001F60A"
+                    % (what, _budget_text(budget), what, min(in_stock_prices), max(in_stock_prices))), None, []
+        return ("Sorry, I couldn't find matching products right now. You can browse our full collection at "
+                "https://www.invicreation.com \U0001F60A"), None, []
+    pool.sort(key=lambda x: x[0])
+    reply, top_image, image_list = build_suggestion_reply(
+        message, [p for _, p in pool], top_k=5, exclude_skus=exclude_skus,
+        customer_id=customer_id, workspace_id=workspace_id)
+    if image_list and "\n\n" in reply:
+        header = "Sure! Here are some %s %s \U0001F483:" % (what, _budget_text(budget))
+        reply = header + "\n\n" + reply.split("\n\n", 1)[1]
+    return reply, top_image, image_list
+
+
+BUDGET_ASK_REPLY = ("Sure! What budget do you have in mind? Tell me an amount, for example under Rs.1000, "
+                    "and add kurthi or salwar set if you like - I'll show you what's available \U0001F60A")
+
+
 @app.route("/ai", methods=["POST"])
 def ai_reply():
     # SECURITY (auth): AI_SERVICE_SHARED_SECRET must be configured, or every
@@ -1313,6 +2004,7 @@ def ai_reply():
     )
     update_customer_score(workspace_id, wa_number, customer_id, message, detected_intent, signal_score, confidence)
     print(f"[INTENT] {customer_id}: {detected_intent} (signal={signal_score}, wa_number={wa_number})")
+    _maybe_capture_followup(message, customer_id, workspace_id, wa_number)
     msg_lower = message.lower().strip()
 
     # ── 1. Greeting cache — no Groq call ──
@@ -1326,8 +2018,40 @@ def ai_reply():
             "type": "text"
         })
 
+    # ── 1b. Human Sales Agent (only when SALES_AGENT_ENABLED=true) ──
+    # STEP6_NEW_ARRIVALS -- grounded new arrivals; runs whether or not the Sales Agent is on
+    if is_new_arrivals_query(message):
+        _already = get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number) or []
+        _picked = new_arrival_products(message, exclude_skus=_already)
+        if not _picked:
+            print(f"[NEW-ARRIVALS] none matched for: {message}")
+            log_message(customer_id, "outgoing", NEW_ARRIVALS_NONE_REPLY, workspace_id=workspace_id, wa_number=wa_number)
+            return jsonify({"reply": NEW_ARRIVALS_NONE_REPLY, "image": None, "type": "text"})
+        _reply, _top_image, _image_list = build_new_arrivals_reply(_picked)
+        remember_skus(customer_id, [parse_product_details({"text": t}).get("SKU", "") for t in _picked],
+                      workspace_id=workspace_id, wa_number=wa_number)
+        print(f"[NEW-ARRIVALS] {message} -> {len(_picked)} products")
+        log_message(customer_id, "outgoing", _reply, workspace_id=workspace_id, wa_number=wa_number)
+        return jsonify({
+            "reply": _reply,
+            "image": _top_image,
+            "images": _image_list,
+            "type": "product" if _top_image else "text"
+        })
+    # 1b. Human Sales Agent (continues)
+    agent_result = _try_sales_agent(message, customer_id, workspace_id, wa_number)
+    if agent_result:
+        _log_text = agent_result.pop("log_text", None) or agent_result.get("reply", "")
+        print(f"[SALES-AGENT] {message} -> {agent_result.get('intent')}")
+        log_message(customer_id, "outgoing", _log_text, workspace_id=workspace_id, wa_number=wa_number)
+        return jsonify(agent_result)
+
     # ── 2. Company details ──
-    if any(kw in msg_lower for kw in COMPANY_KEYWORDS):
+    # (with the agent on, a message that contains a SKU goes to the SKU rule below,
+    #  so words like "details" can no longer send the company address for a SKU)
+    if any(kw in msg_lower for kw in COMPANY_KEYWORDS) and not (
+            _sales_agent_enabled()
+            and re.search(r'\b(IC[A-Z]\d+)\b', message, re.IGNORECASE)):
         print(f"[COMPANY] {message}")
         log_message(customer_id, "outgoing", COMPANY_REPLY, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
         return jsonify({
@@ -1337,15 +2061,16 @@ def ai_reply():
         })
 
     # ── 3. SKU detection — send image + details ──
-    sku_match = re.search(r'\b(ICK\d+|ICS\d+|ICC\d+)\b', message, re.IGNORECASE)
+    sku_match = re.search(r'\b(IC[A-Z]\d+)\b', message, re.IGNORECASE)
     if sku_match:
         sku = sku_match.group(1).upper()
         products = load_products()
-        product = find_product_by_sku(sku, products)
+        product = find_product_by_sku(sku, products) or find_product_text_in_db(sku, workspace_id)
         if product:
             details = parse_product_details(product)
             reply, image_url = build_product_reply(details)
-            print(f"[SKU] {sku} → {details.get('Product', '')}")
+            remember_skus(customer_id, [sku], workspace_id=workspace_id, wa_number=wa_number)
+            print(f"[SKU] {sku} -> {details.get('Product', '')}")
             log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
             return jsonify({
                 "reply": reply,
@@ -1363,6 +2088,25 @@ def ai_reply():
        
     products = load_products()
 
+    # -- 4a-1. Budget question (BUDGET_PATCH) - real catalog prices, before the order-number lookup --
+    _budget = _parse_budget(message)
+    if (_budget or _mentions_budget_word(msg_lower)) and not _looks_like_order_query(msg_lower):
+        if _budget:
+            already_shown = get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number)
+            reply, top_image, image_list = build_budget_reply(
+                message, products, _budget, exclude_skus=already_shown, customer_id=customer_id, workspace_id=workspace_id)
+            remember_skus(customer_id, [item["sku"] for item in image_list], workspace_id=workspace_id, wa_number=wa_number)
+            print(f"[BUDGET] {message} -> {len(image_list)} products")
+            log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)
+            return jsonify({
+                "reply": reply,
+                "image": top_image,
+                "images": image_list,
+                "type": "product" if top_image else "text"
+            })
+        print(f"[BUDGET] asked for budget: {message}")
+        log_message(customer_id, "outgoing", BUDGET_ASK_REPLY, workspace_id=workspace_id, wa_number=wa_number)
+        return jsonify({"reply": BUDGET_ASK_REPLY, "image": None, "type": "text"})
     # ── 4a. "What collection do you have" — warm intro + one item per category ──
     collection_overview_keywords = ["what collection", "collections do you have", "what do you have",
                                      "what all", "what products", "what items", "categories"]
@@ -1443,7 +2187,8 @@ def ai_reply():
             print("[PHASE1] Semantic fallback matched for: " + message)
     policy_context = search_policy_faq(message, workspace_id=workspace_id)  # PHASE 5
     conversation_history = get_recent_conversation(customer_id, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
-    reply = ask_groq(message, context, conversation_history, policy_context)  # PHASE 5: policy added
+    _closing_ok = detected_intent in BUYING_INTENTS and not _is_memory_question(message)
+    reply = ask_groq(message, context, conversation_history, policy_context, show_closing_line=_closing_ok, followup_note=_pending_followup_note(customer_id, workspace_id, wa_number))  # PHASE 5: policy added
     is_valid, reply = validate_reply(reply, context, policy_context, products)  # PHASE 6
     print(f"[GROQ] {message}" + ("" if is_valid else " [PHASE6: blocked unverified price]"))
     log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
@@ -1525,6 +2270,14 @@ def notify_matching_interests(sku, product_name, doc_text):
     no wa_number to resolve from, so workspace is queried via
     resolve_sole_active_workspace() rather than hardcoded. Skips (rather
     than guessing) once more than one active workspace exists."""
+    if is_test_product_text(doc_text):
+        print("[TEST-FILTER] notify_matching_interests skipped for a test product")
+        return
+    # STEP7A_NOTIFY_AVAILABLE: only a product that can be bought now is worth a follow-up;
+    # a product-updated webhook for an out-of-stock product must not create a draft.
+    if parse_product_details({"text": doc_text}).get("Status", "").strip().lower() != "available":
+        print("[STEP7A] notify_matching_interests skipped: product is not Available")
+        return
     category = detect_category(doc_text)
     color = detect_color(doc_text)
     if not category or not color:
@@ -1561,7 +2314,7 @@ def shopify_product_created():
     if not is_published:
         print(f"[SHOPIFY] Skipped unpublished product: {doc['id']}")
         return jsonify({"status": "skipped - not published"})
-    products = load_products()
+    products = _load_products_raw()
     existing_ids = [p['id'] for p in products]
     if doc['id'] not in existing_ids:
         products.append(doc)
@@ -1580,7 +2333,7 @@ def shopify_product_updated():
     data = request.json
     product = data.get('product') or data
     doc, is_published = shopify_product_to_doc(product)
-    products = load_products()
+    products = _load_products_raw()
     found = False
     for i, p in enumerate(products):
         if p['id'] == doc['id']:
@@ -1598,7 +2351,9 @@ def shopify_product_updated():
         details = parse_product_details(doc)
         notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
         embed_product_chunk(doc['id'], details.get("SKU", ""), doc["text"])
-        return jsonify({"status": "updated"})
+    # STEP2_UNPUBLISHED_FIX: an unpublished product used to fall off the end of this
+    # handler and return None (HTTP 500, so Shopify kept retrying). Always answer 200.
+    return jsonify({"status": "updated" if is_published else "unpublished"})
 
 
 def verify_shopify_webhook(req):
@@ -1805,7 +2560,7 @@ def _sync_order_to_db(order):
 def shopify_product_deleted():
     data = request.json
     handle = data.get('handle') or str(data.get('id', ''))
-    products = load_products()
+    products = _load_products_raw()
     before = len(products)
     products = [p for p in products if p['id'] != handle]
     save_products(products)
