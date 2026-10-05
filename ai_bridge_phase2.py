@@ -523,7 +523,7 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
-SHOPIFY_OAUTH_SCOPES = "read_orders,read_all_orders,read_products,read_customers"
+SHOPIFY_OAUTH_SCOPES = "read_orders,read_all_orders,read_products,read_customers,read_inventory"
 SHOPIFY_OAUTH_REDIRECT_URI = "https://akchat-whatsapp-bot.onrender.com/shopify/oauth/callback"
 
 def lookup_order_by_phone(phone_number, workspace_id=None):
