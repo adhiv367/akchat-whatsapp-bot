@@ -9,6 +9,7 @@ import hashlib
 import base64
 import secrets
 import time
+import threading
 from urllib.parse import urlencode
 
 # PHASE 2: added for persistent memory (replaces in-memory recent_suggestions dict)
@@ -302,9 +303,179 @@ def is_test_product_text(text):
     return False
 
 
+# STEP10_INVENTORY ---------------------------------------------------------------
+# Shopify Inventory Level Update support (DECISION B). Stock status lives in a small
+# Postgres overlay table (coexistence.product_stock_status). invi_products.json is never
+# written by inventory events, and _load_products_raw() stays raw. Everything here is a
+# no-op unless INVENTORY_SYNC_ENABLED is true (default OFF).
+
+def _env_flag(name, default=False):
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _inventory_sync_enabled():
+    return _env_flag("INVENTORY_SYNC_ENABLED", False)
+
+
+def _inventory_dry_run():
+    return _env_flag("INVENTORY_SYNC_DRY_RUN", False)
+
+
+_STATUS_LINE_RE = re.compile(r"(?m)^Status:[^\r\n]*")
+
+
+def apply_stock_status_to_text(text, in_stock):
+    """Rewrite ONLY the 'Status:' line of a product document. Pure and idempotent; text
+    without a Status line is returned unchanged."""
+    if not text:
+        return text
+    label = "Available" if in_stock else "Out of Stock"
+    return _STATUS_LINE_RE.sub("Status: " + label, text, count=1)
+
+
+_STOCK_OVERLAY_TTL = 30.0       # seconds a successful overlay read is reused
+_STOCK_OVERLAY_FAIL_TTL = 5.0   # seconds a failed read is reused (do not hammer a sick DB)
+_stock_cache_lock = threading.Lock()
+_stock_overlay_cache = {}       # workspace_id -> (expires_at, {handle: bool})
+_stock_ws_cache = {"exp": 0.0, "ws": None}
+
+
+def _stock_overlay_cache_clear():
+    with _stock_cache_lock:
+        _stock_overlay_cache.clear()
+        _stock_ws_cache["exp"] = 0.0
+        _stock_ws_cache["ws"] = None
+
+
+def stock_overlay_get(workspace_id, use_cache=True):
+    """{handle: in_stock_bool} for one workspace, cached ~30s. Returns {} on any failure so
+    callers fall back to the status already in the catalog file."""
+    if workspace_id is None:
+        return {}
+    now = time.time()
+    if use_cache:
+        with _stock_cache_lock:
+            hit = _stock_overlay_cache.get(workspace_id)
+            if hit and hit[0] > now:
+                return dict(hit[1])
+    result = {}
+    ok = False
+    conn = get_db_conn()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT handle, in_stock FROM coexistence.product_stock_status WHERE workspace_id = %s",
+                    (workspace_id,),
+                )
+                result = {h: bool(s) for h, s in cur.fetchall()}
+            ok = True
+        except Exception as e:
+            print(f"[INVENTORY] overlay read failed, using catalog file status: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    with _stock_cache_lock:
+        _stock_overlay_cache[workspace_id] = (now + (_STOCK_OVERLAY_TTL if ok else _STOCK_OVERLAY_FAIL_TTL), dict(result))
+    return result
+
+
+def _overlay_workspace_id():
+    """Workspace used for the overlay, resolved the same way the Shopify webhooks resolve it
+    and cached briefly so load_products() does not add a DB query per call."""
+    now = time.time()
+    with _stock_cache_lock:
+        if _stock_ws_cache["exp"] > now:
+            return _stock_ws_cache["ws"]
+    ws = resolve_sole_active_workspace()
+    with _stock_cache_lock:
+        _stock_ws_cache["ws"] = ws
+        _stock_ws_cache["exp"] = now + (_STOCK_OVERLAY_TTL if ws else _STOCK_OVERLAY_FAIL_TTL)
+    return ws
+
+
+def _stock_overlay_doc_text(handle, text):
+    """For the product webhooks: product text with the overlay status applied when this handle
+    has an overlay row (read fresh, not from the cache). Falls back to the text as given."""
+    if not _inventory_sync_enabled():
+        return text
+    try:
+        ws = resolve_sole_active_workspace()
+        if not ws:
+            return text
+        overlay = stock_overlay_get(ws, use_cache=False)
+        if handle in overlay:
+            return apply_stock_status_to_text(text, overlay[handle])
+    except Exception as e:
+        print(f"[INVENTORY] overlay lookup for product webhook failed: {e}")
+    return text
+
+
+def stock_overlay_clear(handle):
+    """Drop one handle's overlay row (product deleted, unpublished or re-created) so a
+    re-created product never inherits stale stock state. Best effort; no-op when disabled."""
+    if not _inventory_sync_enabled() or not handle:
+        return
+    try:
+        ws = resolve_sole_active_workspace()
+        if not ws:
+            return
+        conn = get_db_conn()
+        if not conn:
+            print("[INVENTORY] overlay clear skipped - no DB connection")
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM coexistence.product_stock_status WHERE workspace_id = %s AND handle = %s",
+                    (ws, handle),
+                )
+            conn.commit()
+        except Exception as e:
+            print(f"[INVENTORY] overlay clear failed: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            conn.close()
+    finally:
+        _stock_overlay_cache_clear()
+# END STEP10_INVENTORY (overlay helpers) -----------------------------------------
+
+
 def load_products():
-    """Catalog for everything customer-facing: test products are removed."""
-    return [p for p in _load_products_raw() if not is_test_product_text(p.get("text", ""))]
+    """Catalog for everything customer-facing: test products are removed. When inventory sync
+    is enabled the DB stock overlay is applied on top; any overlay problem falls back to the
+    status in the catalog file."""
+    products = [p for p in _load_products_raw() if not is_test_product_text(p.get("text", ""))]
+    if not _inventory_sync_enabled():
+        return products
+    try:
+        ws = _overlay_workspace_id()
+        overlay = stock_overlay_get(ws) if ws else {}
+    except Exception as e:
+        print(f"[INVENTORY] overlay skipped: {e}")
+        return products
+    if not overlay:
+        return products
+    out = []
+    for p in products:
+        h = p.get("id")
+        if h in overlay:
+            p = dict(p)
+            p["text"] = apply_stock_status_to_text(p.get("text", ""), overlay[h])
+        out.append(p)
+    return out
 
 
 def _skus_in_text(text):
@@ -2324,6 +2495,7 @@ def shopify_product_created():
         save_products(products)
         print(f"[SHOPIFY] Added new product: {doc['id']}")
         details = parse_product_details(doc)
+        stock_overlay_clear(doc['id'])  # STEP10_INVENTORY: a new product must not inherit stale stock state
         notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
         embed_product_chunk(doc['id'], details.get("SKU", ""), doc["text"])
         return jsonify({"status": "added", "id": doc['id']})
@@ -2353,10 +2525,14 @@ def shopify_product_updated():
         products.append(doc)
     save_products(products)
     print(f"[SHOPIFY] Updated product: {doc['id']} (published={is_published})")
+    if (not is_published) or (not found):
+        stock_overlay_clear(doc['id'])  # STEP10_INVENTORY: left or re-entered the catalog -> no stale stock state
     if is_published:
         details = parse_product_details(doc)
-        notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
-        embed_product_chunk(doc['id'], details.get("SKU", ""), doc["text"])
+        # STEP10_INVENTORY: an inventory event's status must win over the payload's status
+        _doc_text = _stock_overlay_doc_text(doc['id'], doc["text"])
+        notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), _doc_text)
+        embed_product_chunk(doc['id'], details.get("SKU", ""), _doc_text)
     # STEP2_UNPUBLISHED_FIX: an unpublished product used to fall off the end of this
     # handler and return None (HTTP 500, so Shopify kept retrying). Always answer 200.
     return jsonify({"status": "updated" if is_published else "unpublished"})
@@ -2573,8 +2749,201 @@ def shopify_product_deleted():
     before = len(products)
     products = [p for p in products if p['id'] != handle]
     save_products(products)
+    stock_overlay_clear(handle)  # STEP10_INVENTORY
     print(f"[SHOPIFY] Deleted product: {handle} ({before} -> {len(products)})")
     return jsonify({"status": "deleted", "remaining": len(products)})
+
+# STEP10_INVENTORY ---------------------------------------------------------------
+class ShopifyTransientError(Exception):
+    """Retryable Shopify/API failure (timeout, 429, 5xx, auth/scope failure, bad response)."""
+
+
+SHOPIFY_INVENTORY_API_VERSION = os.environ.get("SHOPIFY_INVENTORY_API_VERSION", "2024-01")
+_INVENTORY_LOOKUP_QUERY = """
+query InventoryItemStock($id: ID!) {
+  inventoryItem(id: $id) {
+    id
+    tracked
+    variant { product { handle totalInventory tracksInventory } }
+  }
+}
+"""
+
+
+def shopify_inventory_lookup(inventory_item_id):
+    """One read-only GraphQL call: inventory item -> product handle + current total stock.
+    Returns {"handle", "total_inventory", "tracked"}, or None when Shopify has no such item.
+    Raises ShopifyTransientError on timeout / 429 / 5xx / auth or scope failure / bad response.
+    Needs the read_inventory scope in addition to read_products."""
+    item_id = str(inventory_item_id or "").strip()
+    if not re.fullmatch(r"\d+", item_id):
+        return None
+    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
+        raise ShopifyTransientError("Shopify store domain/token not configured")
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_INVENTORY_API_VERSION}/graphql.json"
+    headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json"}
+    body = {"query": _INVENTORY_LOOKUP_QUERY, "variables": {"id": f"gid://shopify/InventoryItem/{item_id}"}}
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=8)
+    except requests.exceptions.RequestException as e:
+        raise ShopifyTransientError(f"request failed: {type(e).__name__}")
+    if resp.status_code != 200:
+        # 429, 5xx, 401/403 (token or scope) and anything else unexpected: retry later, lose nothing
+        raise ShopifyTransientError(f"HTTP {resp.status_code}")
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise ShopifyTransientError("response was not JSON")
+    if not isinstance(payload, dict) or payload.get("errors"):
+        raise ShopifyTransientError("GraphQL errors (throttled, access denied or scope missing)")
+    item = (payload.get("data") or {}).get("inventoryItem")
+    if not item:
+        return None
+    product = ((item.get("variant") or {}).get("product")) or {}
+    handle = (product.get("handle") or "").strip()
+    if not handle:
+        return None
+    total = product.get("totalInventory")
+    if not isinstance(total, int):
+        raise ShopifyTransientError("totalInventory missing in response")
+    tracked = bool(item.get("tracked")) and bool(product.get("tracksInventory"))
+    return {"handle": handle, "total_inventory": total, "tracked": tracked}
+
+
+def _inv_response(status, code=200, **extra):
+    body = {"status": status}
+    body.update(extra)
+    return jsonify(body), code
+
+
+@app.route("/shopify/inventory-update", methods=["POST"])
+def shopify_inventory_update():
+    """Shopify inventory_levels/update. The payload is only a trigger: it is location-specific,
+    so its 'available' is never trusted. Current stock is re-read from Shopify, which makes
+    retried and out-of-order events converge. NEVER calls embed_product_chunk / Gemini."""
+    raw_body = verify_shopify_webhook(request)
+    if raw_body is None:
+        return "Unauthorized", 401
+    if not _inventory_sync_enabled():
+        return _inv_response("disabled")
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        return _inv_response("ignored", reason="invalid json")
+    item_id = payload.get("inventory_item_id") if isinstance(payload, dict) else None
+    if item_id in (None, "") or not re.fullmatch(r"\d+", str(item_id)):
+        return _inv_response("ignored", reason="no inventory_item_id")
+
+    conn = get_db_conn()
+    if not conn:
+        return _inv_response("db unavailable", 503)
+    notify_args = None
+    try:
+        workspace_id = resolve_sole_active_workspace()
+        if not workspace_id:
+            print("[INVENTORY] skipped - workspace could not be uniquely resolved")
+            return _inv_response("ignored", reason="workspace unresolved")
+        try:
+            info = shopify_inventory_lookup(item_id)
+        except ShopifyTransientError as e:
+            print(f"[INVENTORY] Shopify lookup failed (will be retried): {e}")
+            return _inv_response("shopify unavailable", 503)
+        if not info:
+            return _inv_response("ignored", reason="unknown inventory item")
+        if not info.get("tracked"):
+            return _inv_response("ignored", reason="inventory not tracked")
+        handle = info.get("handle")
+        total = info.get("total_inventory")
+        if not handle or not isinstance(total, int):
+            return _inv_response("ignored", reason="incomplete lookup")
+        file_text = None
+        for p in _load_products_raw():
+            if p.get("id") == handle:
+                file_text = p.get("text", "")
+                break
+        if file_text is None:
+            return _inv_response("ignored", reason="handle not in catalog")
+        if is_test_product_text(file_text):
+            return _inv_response("ignored", reason="test product")
+        in_stock = total > 0
+        if _inventory_dry_run():
+            print(f"[INVENTORY] dry-run: {handle} -> {'Available' if in_stock else 'Out of Stock'} (total={total})")
+            return _inv_response("dry-run", handle=handle, in_stock=in_stock, total_inventory=total)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"stock:{workspace_id}:{handle}",))
+            cur.execute(
+                "SELECT in_stock FROM coexistence.product_stock_status WHERE workspace_id = %s AND handle = %s",
+                (workspace_id, handle),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                previous = bool(row[0])
+            else:
+                previous = parse_product_details({"text": file_text}).get("Status", "").strip().lower() == "available"
+            cur.execute(
+                "INSERT INTO coexistence.product_stock_status (workspace_id, handle, in_stock, updated_at) "
+                "VALUES (%s, %s, %s, NOW()) "
+                "ON CONFLICT (workspace_id, handle) DO UPDATE SET in_stock = EXCLUDED.in_stock, updated_at = NOW()",
+                (workspace_id, handle, in_stock),
+            )
+            # Rewrite ONLY the Status line of the existing RAG document + chunk(s). The embedding,
+            # SKU, handle and document id are never touched; nothing is deleted or re-inserted.
+            cur.execute(
+                "SELECT id, content FROM coexistence.knowledge_documents "
+                "WHERE workspace_id = %s AND source_type = 'product' AND metadata->>'handle' = %s",
+                (workspace_id, handle),
+            )
+            for doc_id, content in cur.fetchall():
+                new_content = apply_stock_status_to_text(content, in_stock)
+                if new_content != content:
+                    cur.execute(
+                        "UPDATE coexistence.knowledge_documents SET content = %s WHERE id = %s",
+                        (new_content, doc_id),
+                    )
+                cur.execute(
+                    "SELECT DISTINCT chunk_text FROM coexistence.knowledge_chunks "
+                    "WHERE document_id = %s AND workspace_id = %s",
+                    (doc_id, workspace_id),
+                )
+                for (chunk_text,) in cur.fetchall():
+                    new_chunk = apply_stock_status_to_text(chunk_text, in_stock)
+                    if new_chunk != chunk_text:
+                        cur.execute(
+                            "UPDATE coexistence.knowledge_chunks SET chunk_text = %s "
+                            "WHERE document_id = %s AND workspace_id = %s AND chunk_text = %s",
+                            (new_chunk, doc_id, workspace_id, chunk_text),
+                        )
+        conn.commit()
+        _stock_overlay_cache_clear()
+        print(f"[INVENTORY] {handle}: {'Available' if previous else 'Out of Stock'} -> "
+              f"{'Available' if in_stock else 'Out of Stock'} (total={total})")
+        if in_stock and not previous:
+            new_text = apply_stock_status_to_text(file_text, True)
+            details = parse_product_details({"text": new_text})
+            notify_args = (details.get("SKU", ""), details.get("Product", handle), new_text)
+    except Exception as e:
+        print(f"[INVENTORY] failed, nothing committed (Shopify will retry): {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return _inv_response("error", 503)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # Only a real Out of Stock -> Available transition notifies, after commit and outside the DB lock.
+    if notify_args:
+        try:
+            notify_matching_interests(*notify_args)
+        except Exception as e:
+            print(f"[INVENTORY] restock notification failed (stock state already saved): {e}")
+    return _inv_response("updated", handle=handle, in_stock=in_stock)
+# END STEP10_INVENTORY (route) ---------------------------------------------------
+
 
 @app.route("/shopify/oauth/install", methods=["GET"])
 def shopify_oauth_install():
