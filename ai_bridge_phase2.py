@@ -524,7 +524,7 @@ SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 SHOPIFY_OAUTH_SCOPES = "read_orders,read_all_orders,read_products,read_customers,read_inventory"
-SHOPIFY_OAUTH_REDIRECT_URI = "https://akchat-whatsapp-bot.onrender.com/shopify/oauth/callback"
+SHOPIFY_OAUTH_REDIRECT_URI = "https://akchat-whatsapp-bot-s2s2.onrender.com/shopify/oauth/callback"
 
 def lookup_order_by_phone(phone_number, workspace_id=None):
     """PHASE 4 (rebuilt): looks up order(s) by phone using our own local
