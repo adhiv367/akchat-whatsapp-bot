@@ -2308,7 +2308,10 @@ def notify_matching_interests(sku, product_name, doc_text):
         prepare_followup_for_interest(interest_id, customer_number, category, color, sku, product_name, product_handle)
 @app.route("/shopify/product-created", methods=["POST"])
 def shopify_product_created():
-    data = request.json
+    raw_body = verify_shopify_webhook(request)
+    if raw_body is None:
+        return "Unauthorized", 401
+    data = json.loads(raw_body)
     product = data.get('product') or data
     doc, is_published = shopify_product_to_doc(product)
     if not is_published:
@@ -2330,7 +2333,10 @@ def shopify_product_created():
 
 @app.route("/shopify/product-updated", methods=["POST"])
 def shopify_product_updated():
-    data = request.json
+    raw_body = verify_shopify_webhook(request)
+    if raw_body is None:
+        return "Unauthorized", 401
+    data = json.loads(raw_body)
     product = data.get('product') or data
     doc, is_published = shopify_product_to_doc(product)
     products = _load_products_raw()
@@ -2558,7 +2564,10 @@ def _sync_order_to_db(order):
 
 @app.route("/shopify/product-deleted", methods=["POST"])
 def shopify_product_deleted():
-    data = request.json
+    raw_body = verify_shopify_webhook(request)
+    if raw_body is None:
+        return "Unauthorized", 401
+    data = json.loads(raw_body)
     handle = data.get('handle') or str(data.get('id', ''))
     products = _load_products_raw()
     before = len(products)
