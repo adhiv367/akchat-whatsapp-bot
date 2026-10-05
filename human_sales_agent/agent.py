@@ -18,7 +18,9 @@ Reply with ONLY valid JSON, no other text, in this exact shape:
   "budget_hint": "number or null",
   "size_hint": "string or null",
   "search_query": "a short natural-language query to search the product catalog with, or null if not a product question",
-  "handoff_required": true/false,
+  "wants_more": true/false,
+"collection": "diwali" or null,
+"handoff_required": true/false,
   "handoff_reason": "string or null"
 }
 How to choose the intent - read the WHOLE message and the conversation, never react to a single word:
@@ -32,6 +34,9 @@ Set handoff_required=true for ANY of these — check carefully, do not miss this
 - complaints, damaged/refund requests, angry tone
 - customer explicitly asks for a human, a real person, an agent, a team member, or says things like "talk to someone", "connect me to a person", "I want to speak to staff"
 - customer says the AI/bot is not helping
+wants_more: true ONLY when the customer is asking to see more, other or further items beyond those already shown in the recent conversation, in any wording or language (for example: show other dresses, anything else, still more, in Tamil too). false when "more" means something else (more details, more expensive, more sizes) or when no items were shown yet.
+collection: "diwali" when the customer asks for the Diwali, festival, festive or pandigai collection or festive wear, in any spelling or language; otherwise null.
+
 This is a safety-critical check. When in doubt about whether a message requests a human, set handoff_required=true rather than false.
 Never guess facts — this step is understanding intent only, not answering."""
 

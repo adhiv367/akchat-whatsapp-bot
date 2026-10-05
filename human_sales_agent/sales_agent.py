@@ -54,7 +54,7 @@ HANDOFF_FALLBACK_REPLY = ("Thanks for letting me know - I've noted this, and one
 
 NEW_ARRIVAL_TAG = "temp-new"
 CARD_INTENTS = {"PRODUCT_DISCOVERY", "PRODUCT_AVAILABILITY", "COLOR_ENQUIRY"}
-MAX_CARDS = 3
+MAX_CARDS = 5
 CARDS_INSTRUCTION = (
     "\n\n[INSTRUCTION FOR THIS REPLY: full product cards (photo, price, sizes, link) "
     "are sent automatically right after your message. Write ONLY a short, warm 1-2 line "
@@ -101,6 +101,26 @@ def _result(understanding, reply, image=None, images=None, log_text=None):
         "handoff_reason": understanding.get("handoff_reason"),
         "log_text": log_text if log_text is not None else reply,  # /ai removes this before replying
     }
+
+
+import re as _re
+DIWALI_RE = _re.compile(r"diwal|diwli|diwlai|deepaval|deepawal|divali|dipaval", _re.I)
+MORE_RE = _re.compile(r"^\s*(show\s+)?(me\s+)?(more|next|another)\b|\bmore\s+(designs?|dresses|options|please|pls)\b", _re.I)
+_TOPIC = {}  # (workspace_id, customer_id) -> {"offset": n, "t": time}
+
+
+def _norm_sku(s):
+    return (s or "").strip().rstrip("*").upper()
+
+
+def _diwali_products():
+    # Diwali = ICP category only, in stock, in catalog order.
+    out = []
+    for p in product_search.load_products():
+        t = p.get("text", "")
+        if _norm_sku(_text_sku(t)).startswith("ICP") and _is_available(t):
+            out.append(t)
+    return out
 
 
 def _new_arrival_products(exclude_skus=None, limit=MAX_CARDS):
@@ -245,15 +265,39 @@ def run(message, customer_id, workspace_id, wa_number):
     if _note:
         verified_data["followup_note"] = _note
 
+    # DIWALI_ICP: festival requests show ONLY in-stock ICP products, MAX_CARDS per reply;
+    # "more" shows the next page.
+    _dmode = False
+    _key = (workspace_id, customer_id)
+    _st = _TOPIC.get(_key) or {}
+    _live = bool(_st) and (time.time() - _st.get("t", 0) < 1800)
+    _wm = understanding.get("wants_more")
+    _is_more = (_wm is True) if isinstance(_wm, bool) else bool(MORE_RE.search(message or ""))
+    if _is_more and (understanding.get("color_hint") or understanding.get("category_hint")):
+        _is_more = False  # names a new colour/category: a fresh search, not paging
+    _is_diwali = (str(understanding.get("collection") or "").lower() == "diwali") or bool(DIWALI_RE.search(message or ""))
+    if not handoff and (_is_diwali or (_is_more and _live)):
+        _icp = _diwali_products()
+        _start = _st.get("offset", 0) if (_is_more and _live and not _is_diwali) else 0
+        _page = _icp[_start:_start + MAX_CARDS]
+        if not _page:
+            _TOPIC.pop(_key, None)
+            return _result(understanding, "That's all the Diwali pieces we have right now. Would you like to see kurthis or other sets?")
+        _TOPIC[_key] = {"offset": _start + len(_page), "t": time.time()}
+        verified_data["products"] = _page
+        understanding["intent"] = "PRODUCT_DISCOVERY"
+        _dmode = True
+    elif not _is_more:
+        _TOPIC.pop(_key, None)
     cards = []
     if (understanding.get("intent") in CARD_INTENTS
             and not handoff
             and verified_data.get("products")):
-        cards = _build_cards(verified_data["products"], exclude_skus=already_shown)
+        cards = _build_cards(verified_data["products"], exclude_skus=([] if _dmode else already_shown))
 
     # ── Call 2: write the reply from the real data ──
     reply, _was_valid = agent.generate_reply(
-        message + CARDS_INSTRUCTION if cards else message,
+        ((("Customer asks for the Diwali collection (spell it Diwali). Original message: " + message) if _dmode else message) + CARDS_INSTRUCTION) if cards else message,
         understanding, verified_data, history)
 
     if not cards and reply.lower().startswith("sorry, i'm having trouble"):
