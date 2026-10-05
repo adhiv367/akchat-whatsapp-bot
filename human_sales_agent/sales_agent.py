@@ -123,6 +123,75 @@ def _diwali_products():
     return out
 
 
+CATEGORY_PREFIXES = [("ICK", "Kurthis"), ("ICS", "Salwar Suit Sets"), ("ICM", "Maxi Dresses")]
+
+
+def _category_cards():
+    # CATEGORY_CARDS: one in-stock product (card + photo) per main category, in catalog order.
+    picked = {}
+    for p in product_search.load_products():
+        t = p.get("text", "")
+        sku = _norm_sku(_text_sku(t))
+        if not sku or sku.startswith("TEST") or not _is_available(t):
+            continue
+        for pre, _n in CATEGORY_PREFIXES:
+            if sku.startswith(pre) and pre not in picked:
+                picked[pre] = t
+    texts = [picked[pre] for pre, _n in CATEGORY_PREFIXES if pre in picked]
+    return _build_cards(texts, max_cards=len(texts)) if texts else []
+
+
+def _category_cards_result(understanding, message, cards):
+    if any("\u0b80" <= ch <= "\u0bff" for ch in (message or "")):
+        intro = "எங்களிடம் குர்தி, சல்வார் செட், மேக்ஸி டிரெஸ் உள்ளன. ஒவ்வொன்றிலும் ஒரு டிசைன் இதோ 😊"
+    else:
+        intro = "We have Kurthis, Salwar Suit Sets and Maxi Dresses. Here is one design from each 😊 Tell me which one you'd like to see more of!"
+    full_text = intro + "\n\n" + "\n\n".join(c["text"] for c in cards)
+    images = [{"sku": c["sku"], "name": c["name"], "image": c["image"]} for c in cards if c["image"]]
+    log_text = intro + "\n(Shown: " + ", ".join(c["name"] + " (" + c["sku"] + ")" for c in cards) + ")"
+    out = _result(understanding, full_text, image=images[0]["image"] if images else None,
+                  images=images, log_text=log_text)
+    out["intro"] = intro
+    out["cards"] = cards
+    return out
+
+
+GENERIC_WORDS = {"kurthi", "kurthis", "kurti", "kurtis", "kurta", "kurtas", "salwar", "salwars",
+                 "suit", "suits", "set", "sets", "maxi", "maxis", "dress", "dresses", "design", "designs",
+                 "collection", "model", "models", "pure", "cotton", "types", "type", "all", "some", "new"}
+
+
+def _category_of(*texts):
+    # CATEGORY_FILTER: map the AI's category words to the exact catalog Type value.
+    t = " ".join(str(x) for x in texts if x).lower()
+    if "salwar" in t or "suit" in t:
+        return "salwar suit set"
+    if "maxi" in t:
+        return "pure cotton maxi"
+    if "kurthi" in t or "kurti" in t or "kurta" in t:
+        if _re.search(r"\bsets?\b|co-?ord", t):
+            return "cotton kurthi set"
+        return "cotton kurthi"
+    return None
+
+
+def _type_of(text):
+    for ln in text.split("\n"):
+        if ln.startswith("Type:"):
+            return ln.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def _by_category(cat):
+    out = []
+    for p in product_search.load_products():
+        t = p.get("text", "")
+        sku = _norm_sku(_text_sku(t))
+        if sku and not sku.startswith("TEST") and _type_of(t) == cat and _is_available(t):
+            out.append(t)
+    return out
+
+
 def _new_arrival_products(exclude_skus=None, limit=MAX_CARDS):
     """Products tagged temp-new, Available only. SKUs this customer was already
     shown come last."""
@@ -227,6 +296,9 @@ def run(message, customer_id, workspace_id, wa_number):
             return _result(understanding, prod.COMPANY_REPLY)
 
         if intent == "CATEGORY_OVERVIEW":
+            _cc = _category_cards()
+            if _cc:
+                return _category_cards_result(understanding, message, _cc)
             reply, top_image, image_list = prod.build_collection_overview_reply(prod.load_products())
             return _result(understanding, reply, image=top_image, images=image_list)
 
@@ -255,6 +327,24 @@ def run(message, customer_id, workspace_id, wa_number):
             time.sleep(pause)
         verified_data = agent.gather_verified_data(
             understanding, customer_id, workspace_id=workspace_id, wa_number=wa_number)
+
+    # CATEGORY_FILTER: a plain category request ("show me kurthis") must return that category only.
+    try:
+        if intent in CARD_INTENTS and not handoff:
+            _q = understanding.get("search_query") or understanding.get("referenced_product_hint") or ""
+            _cat = _category_of(understanding.get("category_hint"), _q)
+            if _cat:
+                _words = _re.findall(r"[a-z]+", str(_q).lower())
+                if _words and all(w in GENERIC_WORDS for w in _words) and not understanding.get("color_hint"):
+                    _pool = _by_category(_cat)
+                else:
+                    _ok = {_cat, "cotton kurthi set"} if _cat == "cotton kurthi" else {_cat}
+                    _pool = [t for t in verified_data.get("products", [])
+                             if _type_of(t) in _ok and _is_available(t)]
+                if _pool:
+                    verified_data["products"] = _pool[:10]
+    except Exception as _ce:
+        print(f"[SALES-AGENT] category filter skipped: {_ce}")
 
     # STEP4_SA_FOLLOWUP: let the reply step see this customer's saved follow-up plan (None when the
     # feature is off or there is none, so nothing changes in that case).
