@@ -490,6 +490,18 @@ def _skus_in_text(text):
     return out
 
 
+def _own_skus_in_text(text):
+    """EXACT-SKU-FIX: only the product's OWN base SKU from the 'SKU:' line (not 'All SKUs:'), upper-cased, trailing * removed."""
+    out = set()
+    for line in (text or "").split("\n"):
+        if line.strip().lower().startswith("sku:"):
+            for s in line.split(":", 1)[1].split(","):
+                s = s.strip().upper().rstrip("*").strip()
+                if s:
+                    out.add(s)
+    return out
+
+
 def _catalog_test_skus():
     """STEP1C: SKUs the catalog file marks as test products. Used to drop stale knowledge
     chunks of a product that was tagged 'test' after it had already been embedded.
@@ -553,6 +565,10 @@ Status: {'Available' if in_stock else 'Out of Stock'}"""
 def find_product_by_sku(sku, products):
     """Find product by SKU — checks both SKU: field and All SKUs: field"""
     sku_upper = sku.upper().strip()
+    # EXACT-SKU-FIX: prefer the product whose OWN base SKU equals the query
+    for p in products:
+        if sku_upper in _own_skus_in_text(p.get("text", "")):
+            return p
     for p in products:
         text = p["text"].upper()
         # Check SKU: line (base sku) OR All SKUs: line (all size variants)
@@ -666,12 +682,19 @@ def find_product_text_in_db(sku, workspace_id):
                 JOIN coexistence.knowledge_documents kd ON kd.id = kc.document_id
                 WHERE kd.source_type = 'product' AND kc.workspace_id = %s
                   AND kc.chunk_text ILIKE %s
-                LIMIT 20
+                LIMIT 200
                 """,
                 (workspace_id, "%" + sku + "%"),
             )
-            for (text,) in cur.fetchall():
-                if sku.upper() in _skus_in_text(text) and not is_test_product_text(text):
+            rows = cur.fetchall()
+            want = sku.upper()
+            # EXACT-SKU-FIX: 1) the product whose OWN base SKU equals the query
+            for (text,) in rows:
+                if want in _own_skus_in_text(text) and not is_test_product_text(text):
+                    return {"text": text}
+            # 2) otherwise old behaviour: SKU found in an 'All SKUs' list
+            for (text,) in rows:
+                if want in _skus_in_text(text) and not is_test_product_text(text):
                     return {"text": text}
     except Exception as e:
         print(f"[SKU-DB] lookup failed: {e}")
