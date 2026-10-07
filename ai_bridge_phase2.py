@@ -112,7 +112,7 @@ def resolve_workspace_id(wa_number):
 # left alone (not backfilled — ambiguous legacy data per audit) — they simply
 # no longer match new tenant-scoped queries.
 
-def get_recent_skus(customer_id, workspace_id=None, wa_number=None, limit=15):  # NO_REPEAT: limit (default unchanged)
+def get_recent_skus(customer_id, workspace_id=None, wa_number=None):
     if not customer_id:
         return []
     conn = get_db_conn()
@@ -125,9 +125,9 @@ def get_recent_skus(customer_id, workspace_id=None, wa_number=None, limit=15):  
                 SELECT sku FROM coexistence.shown_products
                 WHERE customer_id = %s AND workspace_id = %s AND wa_number = %s
                 ORDER BY shown_at DESC
-                LIMIT %s
+                LIMIT 15
                 """,
-                (customer_id, workspace_id, wa_number, int(limit)),
+                (customer_id, workspace_id, wa_number),
             )
             return [row[0] for row in cur.fetchall()]
     except Exception as e:
@@ -1207,8 +1207,6 @@ def build_suggestion_reply(query, products, top_k=5, exclude_skus=None, customer
 # invi_products.json (newest first). Nothing is invented; with no match the customer is told so.
 NEW_ARRIVAL_TAG = "temp-new"
 NEW_ARRIVALS_MAX = 5
-NEW_ARRIVALS_SEEN_REPLY = ("You've already seen all our current new arrivals \U0001F60A "
-                           "Would you like to see a different category, colour or style?")  # NO_REPEAT
 NEW_ARRIVALS_NONE_REPLY = ("I don't have new arrival details right now. You can check "
                            "https://www.invicreation.com or call 9751100905 \U0001F60A")
 _NEW_ARRIVALS_PATTERNS = [
@@ -1241,8 +1239,8 @@ def new_arrival_products(query="", exclude_skus=None, limit=NEW_ARRIVALS_MAX):
     category = detect_category(query or "")
     if not category and re.search(r"\bsuits?\b", (query or "").lower()):
         category = "salwar"
-    exclude = {(x or "").strip().rstrip("*").upper() for x in (exclude_skus or [])}  # NO_REPEAT
-    fresh = []
+    exclude = set(exclude_skus or [])
+    fresh, shown = [], []
     for p in load_products():
         details = parse_product_details(p)
         tags = [t.strip().lower() for t in details.get("Tags", "").split(",")]
@@ -1254,9 +1252,8 @@ def new_arrival_products(query="", exclude_skus=None, limit=NEW_ARRIVALS_MAX):
             hay = (details.get("Type", "") + " " + details.get("Product", "")).lower()
             if not any(w in hay for w in CATEGORY_WORDS_MATCH[category]):
                 continue
-        if (details.get("SKU", "") or "").strip().rstrip("*").upper() not in exclude:
-            fresh.append(p["text"])  # NO_REPEAT: dropped, not moved to the end
-    return fresh[:limit]
+        (shown if details.get("SKU", "") in exclude else fresh).append(p["text"])
+    return (fresh + shown)[:limit]
 
 
 def build_new_arrivals_reply(product_texts):
@@ -2218,14 +2215,12 @@ def ai_reply():
     # ── 1b. Human Sales Agent (only when SALES_AGENT_ENABLED=true) ──
     # STEP6_NEW_ARRIVALS -- grounded new arrivals; runs whether or not the Sales Agent is on
     if is_new_arrivals_query(message):
-        _already = get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number, limit=1000) or []  # NO_REPEAT
+        _already = get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number) or []
         _picked = new_arrival_products(message, exclude_skus=_already)
         if not _picked:
-            _reply_none = (NEW_ARRIVALS_SEEN_REPLY if (_already and new_arrival_products(message, limit=1))
-                           else NEW_ARRIVALS_NONE_REPLY)  # NO_REPEAT: seen-them-all vs truly none
-            print(f"[NEW-ARRIVALS] none to show for: {message}")
-            log_message(customer_id, "outgoing", _reply_none, workspace_id=workspace_id, wa_number=wa_number)
-            return jsonify({"reply": _reply_none, "image": None, "type": "text"})
+            print(f"[NEW-ARRIVALS] none matched for: {message}")
+            log_message(customer_id, "outgoing", NEW_ARRIVALS_NONE_REPLY, workspace_id=workspace_id, wa_number=wa_number)
+            return jsonify({"reply": NEW_ARRIVALS_NONE_REPLY, "image": None, "type": "text"})
         _reply, _top_image, _image_list = build_new_arrivals_reply(_picked)
         remember_skus(customer_id, [parse_product_details({"text": t}).get("SKU", "") for t in _picked],
                       workspace_id=workspace_id, wa_number=wa_number)
