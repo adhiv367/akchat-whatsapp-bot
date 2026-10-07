@@ -121,6 +121,12 @@ REFERENCE_RE = _re.compile(
     _re.I)
 
 
+# NO_REPEAT guard: an English message can only be a reference if it contains a pointing word.
+POINTING_RE = _re.compile(
+    r"\b(?:this|that|these|those|same|again|earlier|before|previous|last|first|second|third|fourth|fifth|"
+    r"showed|sent|shared|shown|the one)\b", _re.I)
+
+
 def _norm_sku(s):
     return (s or "").strip().rstrip("*").upper()
 
@@ -139,10 +145,12 @@ def _is_reference(understanding, message):
     """NO_REPEAT: True when the customer points at a product they were already shown
     ("this one", "that red kurthi again"). The AI decides (refers_to_shown); the regex is only
     a fallback when that flag is absent - same pattern as wants_more."""
+    m = message or ""
     flag = understanding.get("refers_to_shown")
     if isinstance(flag, bool):
+        if flag and m.isascii() and not POINTING_RE.search(m):
+            return False  # NO_REPEAT guard: "show me red kurthi" is browsing, whatever the model said
         return flag
-    m = message or ""
     return bool(REFERENCE_RE.search(m)) and not MORE_RE.search(m)
 
 
