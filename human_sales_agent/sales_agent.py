@@ -108,9 +108,42 @@ DIWALI_RE = _re.compile(r"diwal|diwli|diwlai|deepaval|deepawal|divali|dipaval", 
 MORE_RE = _re.compile(r"^\s*(show\s+)?(me\s+)?(more|next|another)\b|\bmore\s+(designs?|dresses|options|please|pls)\b", _re.I)
 _TOPIC = {}  # (workspace_id, customer_id) -> {"offset": n, "t": time}
 
+# NO_REPEAT: a customer must not be shown the same product twice while browsing.
+SHOWN_MEMORY_LIMIT = 1000   # how many remembered SKUs to read back (the bridge default is only 15)
+WIDE_POOL = 30              # search candidates looked at once this customer has already seen products
+ALREADY_SEEN_REPLY = ("You've already seen all the matching designs I have for this \U0001F60A "
+                      "Would you like to see another category, a different colour or style, or our new arrivals?")
+ALREADY_SEEN_NEW_REPLY = ("You've already seen all our current new arrivals \U0001F60A "
+                          "Would you like to see a different category, colour or style?")
+# Used ONLY when the AI's own "refers_to_shown" flag is missing (e.g. the understand step failed).
+REFERENCE_RE = _re.compile(
+    r"\b(?:again|same one|this one|that one|the one you|you (?:showed|sent|shared)|(?:showed|sent|shown) earlier)\b",
+    _re.I)
+
 
 def _norm_sku(s):
     return (s or "").strip().rstrip("*").upper()
+
+
+def _get_shown(customer_id, workspace_id, wa_number):
+    """NO_REPEAT: every SKU remembered for this customer (not just the bridge's default 15)."""
+    try:
+        return prod.get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number,
+                                    limit=SHOWN_MEMORY_LIMIT) or []
+    except TypeError:
+        # bridge without the new `limit` argument yet: behave exactly as before
+        return prod.get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number) or []
+
+
+def _is_reference(understanding, message):
+    """NO_REPEAT: True when the customer points at a product they were already shown
+    ("this one", "that red kurthi again"). The AI decides (refers_to_shown); the regex is only
+    a fallback when that flag is absent - same pattern as wants_more."""
+    flag = understanding.get("refers_to_shown")
+    if isinstance(flag, bool):
+        return flag
+    m = message or ""
+    return bool(REFERENCE_RE.search(m)) and not MORE_RE.search(m)
 
 
 def _diwali_products():
@@ -193,28 +226,29 @@ def _by_category(cat):
 
 
 def _new_arrival_products(exclude_skus=None, limit=MAX_CARDS):
-    """Products tagged temp-new, Available only. SKUs this customer was already
-    shown come last."""
-    exclude = set(exclude_skus or [])
-    fresh, stale = [], []
+    """Products tagged temp-new, Available only. NO_REPEAT: SKUs this customer was already
+    shown are left out (dropped, not moved to the end)."""
+    exclude = {_norm_sku(s) for s in (exclude_skus or [])}
+    out = []
     for p in product_search.load_products():
         t = p.get("text", "")
         tags = next((ln for ln in t.split("\n") if ln.lower().startswith("tags:")), "")
         _tag_list = [x.strip() for x in tags.split(":", 1)[-1].lower().split(",")]  # STEP6C: exact tag, not a substring
-        if NEW_ARRIVAL_TAG in _tag_list and _is_available(t):
-            (stale if _text_sku(t) in exclude else fresh).append(t)
-    return (fresh + stale)[:limit]
+        if NEW_ARRIVAL_TAG in _tag_list and _is_available(t) and _norm_sku(_text_sku(t)) not in exclude:
+            out.append(t)
+    return out[:limit]
 
 
 def _build_cards(product_texts, exclude_skus=None, max_cards=MAX_CARDS):
     """One card per product, same layout as the SKU lookup reply. Only the
     last card keeps the 'To order...' footer. Values come straight from the
     existing product data - nothing is invented."""
-    exclude = set(exclude_skus or [])
-    available = [t for t in product_texts if _is_available(t)]
-    ordered = sorted(available, key=lambda t: (1 if _text_sku(t) in exclude else 0))
+    # NO_REPEAT: SKUs this customer was already shown are dropped, never moved to the back.
+    exclude = {_norm_sku(s) for s in (exclude_skus or [])}
+    available = [t for t in product_texts
+                 if _is_available(t) and _norm_sku(_text_sku(t)) not in exclude]
     cards, seen = [], set()
-    for t in ordered:
+    for t in available:
         details = product_search.parse_product_details({"text": t})
         text, image = product_search.build_product_reply(details)
         sku = details.get("SKU", "")
@@ -298,6 +332,8 @@ def run(message, customer_id, workspace_id, wa_number):
         understanding["handoff_reason"] = (understanding.get("handoff_reason")
                                            or "Customer wants to change an existing order")
     handoff = bool(understanding.get("handoff_required"))
+    # NO_REPEAT: is the customer pointing at a product they were already shown?
+    _ref = (not handoff) and _is_reference(understanding, message)
 
     _recovered = False  # STEP10_RECOVER
     if understanding.get("_error"):
@@ -337,11 +373,15 @@ def run(message, customer_id, workspace_id, wa_number):
             return _result(understanding, _order_reply(message, customer_id, workspace_id))
 
     # ── Existing product data ──
-    already_shown = prod.get_recent_skus(customer_id, workspace_id=workspace_id, wa_number=wa_number) or []
+    already_shown = _get_shown(customer_id, workspace_id, wa_number)  # NO_REPEAT: was limited to 15
 
     if intent == "NEW_ARRIVALS" and not handoff:
-        new_products = _new_arrival_products(exclude_skus=already_shown)
+        new_products = _new_arrival_products(exclude_skus=([] if _ref else already_shown),
+                                             limit=(WIDE_POOL if _ref else MAX_CARDS))
         if not new_products:
+            if already_shown and not _ref and _new_arrival_products(limit=1):
+                # NO_REPEAT: there ARE new arrivals, this customer has simply seen them all
+                return _result(understanding, ALREADY_SEEN_NEW_REPLY)
             # STEP6B: no new arrivals -> say so honestly, never fall back to generic products
             return _result(understanding, prod.NEW_ARRIVALS_NONE_REPLY)
         verified_data = {"products": new_products, "orders": [], "images": [], "policy": []}
@@ -353,8 +393,11 @@ def run(message, customer_id, workspace_id, wa_number):
         pause = _pause_seconds()
         if pause:
             time.sleep(pause)
+        # NO_REPEAT: once this customer has seen products, look at a wider candidate list so that
+        # dropping the already-seen ones still leaves unseen matches. Fresh customers: call unchanged.
+        _kw = {"max_products": WIDE_POOL} if (already_shown and intent in CARD_INTENTS) else {}
         verified_data = agent.gather_verified_data(
-            understanding, customer_id, workspace_id=workspace_id, wa_number=wa_number)
+            understanding, customer_id, workspace_id=workspace_id, wa_number=wa_number, **_kw)
 
     # CATEGORY_FILTER: a plain category request ("show me kurthis") must return that category only.
     try:
@@ -370,7 +413,7 @@ def run(message, customer_id, workspace_id, wa_number):
                     _pool = [t for t in verified_data.get("products", [])
                              if _type_of(t) in _ok and _is_available(t)]
                 if _pool:
-                    verified_data["products"] = _pool[:10]
+                    verified_data["products"] = _pool  # NO_REPEAT: was _pool[:10]; trimmed to the cards below
     except Exception as _ce:
         print(f"[SALES-AGENT] category filter skipped: {_ce}")
 
@@ -408,10 +451,34 @@ def run(message, customer_id, workspace_id, wa_number):
     elif not _is_more:
         _TOPIC.pop(_key, None)
     cards = []
+    _all_seen = False
     if (understanding.get("intent") in CARD_INTENTS
             and not handoff
             and verified_data.get("products")):
-        cards = _build_cards(verified_data["products"], exclude_skus=([] if _dmode else already_shown))
+        _cands = verified_data["products"]
+        _seen_set = {_norm_sku(s) for s in already_shown}
+        if _dmode:
+            cards = _build_cards(_cands, exclude_skus=[])
+        elif _ref and _seen_set:
+            # NO_REPEAT exception: the customer points at something already shown, so show that
+            # product again. If none of the results was shown before, treat them as normal results.
+            _prev = [t for t in _cands if _norm_sku(_text_sku(t)) in _seen_set]
+            cards = _build_cards(_prev or _cands, exclude_skus=[])
+        else:
+            # NO_REPEAT: browsing / new request - products already shown are dropped.
+            cards = _build_cards(_cands, exclude_skus=already_shown)
+            _all_seen = (not cards) and any(_is_available(t) for t in _cands)
+        # the reply step should only see the products that are actually being shown
+        if cards:
+            _on_cards = {_norm_sku(c["sku"]) for c in cards}
+            verified_data["products"] = [t for t in _cands if _norm_sku(_text_sku(t)) in _on_cards] or _cands[:MAX_CARDS]
+        else:
+            verified_data["products"] = _cands[:MAX_CARDS]
+
+    if _all_seen:
+        # NO_REPEAT (Option A): everything that matches was already shown - do not repeat it.
+        print("[SALES-AGENT] NO_REPEAT all matching products were already shown to this customer")
+        return _result(understanding, ALREADY_SEEN_REPLY)
 
     # ── Call 2: write the reply from the real data ──
     if _recovered and not cards:

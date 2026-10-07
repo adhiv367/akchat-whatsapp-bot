@@ -19,6 +19,7 @@ Reply with ONLY valid JSON, no other text, in this exact shape:
   "size_hint": "string or null",
   "search_query": "a short natural-language query to search the product catalog with, or null if not a product question",
   "wants_more": true/false,
+  "refers_to_shown": true/false,
 "collection": "diwali" or null,
 "handoff_required": true/false,
   "handoff_reason": "string or null"
@@ -35,6 +36,7 @@ Set handoff_required=true for ANY of these — check carefully, do not miss this
 - customer explicitly asks for a human, a real person, an agent, a team member, or says things like "talk to someone", "connect me to a person", "I want to speak to staff"
 - customer says the AI/bot is not helping
 wants_more: true ONLY when the customer is asking to see more, other or further items beyond those already shown in the recent conversation, in any wording or language (for example: show other dresses, anything else, still more, in Tamil too). false when "more" means something else (more details, more expensive, more sizes) or when no items were shown yet.
+refers_to_shown: true ONLY when the customer clearly points at a specific product that was ALREADY shown earlier in the recent conversation, in any wording or language (for example: "this one", "that one", "the same one", "show me that red kurthi again", "send me the dress you showed earlier", "I like the second one"). false for every normal browsing or new request, even when it names a colour or a category (for example "show me red kurthi", "show me salwar", "suggest a dress for my friend", "show me party wear"), and false when nothing has been shown yet.
 collection: "diwali" when the customer asks for the Diwali, festival, festive or pandigai collection or festive wear, in any spelling or language; otherwise null.
 
 This is a safety-critical check. When in doubt about whether a message requests a human, set handoff_required=true rather than false.
@@ -138,7 +140,7 @@ def understand(message, customer_id, workspace_id=None, wa_number=None):
     return parsed, history
 
 
-def gather_verified_data(understanding, customer_id, workspace_id=None, wa_number=None):
+def gather_verified_data(understanding, customer_id, workspace_id=None, wa_number=None, max_products=5):  # NO_REPEAT: max_products
     """Deterministic step — no LLM. Pulls real data based on the LLM's
     understanding, so the reply step can never invent facts.
 
@@ -161,7 +163,7 @@ def gather_verified_data(understanding, customer_id, workspace_id=None, wa_numbe
         results = product_search.search(query, products)
         if not results:
             results = product_search.semantic_search_products(query, workspace_id=workspace_id)
-        data["products"] = results[:5]
+        data["products"] = results[:max_products]
 
         # Real product photos for whatever the text search matched on —
         # same get_top_product_images() production already uses for its
