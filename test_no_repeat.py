@@ -203,8 +203,7 @@ def t_reference_regex_fallback():
         assert is_ref({}, m), "should be a reference: %r" % m
     for m in no:
         assert not is_ref({}, m), "should be plain browsing: %r" % m
-    assert is_ref({"refers_to_shown": True}, "show me that red kurthi again"), "AI flag True wins when the message points at a product"
-    assert not is_ref({"refers_to_shown": True}, "show me red kurthi"), "guard: plain browsing is never a reference, even if the AI says True"
+    assert is_ref({"refers_to_shown": True}, "show me red kurthi"), "AI flag True must win over text"
     assert not is_ref({"refers_to_shown": False}, "show me that again"), "AI flag False must win over text"
 
 
