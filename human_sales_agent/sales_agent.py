@@ -251,6 +251,22 @@ def _has_order_details(message):
 
 
 # ── the entry point ──────────────────────────────────────────────────────
+# STEP10_RECOVER: conservative check, used ONLY when the Groq "understand" step has failed.
+# Plain browse / suggest / gift messages get product cards (no LLM); anything that mentions
+# orders, refunds, offers etc. still goes to the old code exactly as before.
+_DISCOVERY_RE = _re.compile(
+    r"\b(suggest|recommend|gift|show me|dress(?:es)?|kurt(?:a|i|ha|hi)s?|salwar|co-?ords?|designs?|options?)\b",
+    _re.I)
+_NOT_DISCOVERY_RE = _re.compile(
+    r"\b(?:order|refund|cancel|return|exchange|track|status|complain|delay|damag|wrong|pay|paid|invoice|discount|offer|coupon|cod|deliver)",
+    _re.I)
+
+
+def _looks_like_discovery(message):
+    m = message or ""
+    return bool(_DISCOVERY_RE.search(m)) and not _NOT_DISCOVERY_RE.search(m)
+
+
 def _mark_failed():
     # SALES_AGENT_PATCH2: tells /ai the AI steps failed, so the old keyword rules that
     # misfire on words like "about" / "my order" are skipped for this message.
@@ -267,6 +283,7 @@ def run(message, customer_id, workspace_id, wa_number):
         return None
     # Never run without a resolved workspace (multi-tenant safety).
     if not workspace_id:
+        print("[SALES-AGENT] STEP10 no workspace_id resolved - handing the message to the old code")
         return None
 
     # ── Call 1: understand ──
@@ -282,13 +299,24 @@ def run(message, customer_id, workspace_id, wa_number):
                                            or "Customer wants to change an existing order")
     handoff = bool(understanding.get("handoff_required"))
 
+    _recovered = False  # STEP10_RECOVER
     if understanding.get("_error"):
         print(f"[SALES-AGENT] understand step failed: {understanding['_error']}")
         if handoff:
             # The keyword safety net still works when Groq is down.
             return _result(understanding, HANDOFF_FALLBACK_REPLY)
-        _mark_failed()
-        return None  # old code takes over
+        if _looks_like_discovery(message):
+            # STEP10_RECOVER: Groq failed but this is a plain browse/gift request, so answer with
+            # product cards (no LLM) instead of the old text template.
+            understanding["intent"] = "PRODUCT_DISCOVERY"
+            understanding["search_query"] = message
+            intent = "PRODUCT_DISCOVERY"
+            _recovered = True
+            print("[SALES-AGENT] STEP10 recovering a discovery message without the LLM")
+        else:
+            print("[SALES-AGENT] STEP10 understand failed, not a discovery message - old code answers")
+            _mark_failed()
+            return None  # old code takes over
 
     # ── Existing data, fixed texts (no second Groq call) ──
     if not handoff:
@@ -386,11 +414,20 @@ def run(message, customer_id, workspace_id, wa_number):
         cards = _build_cards(verified_data["products"], exclude_skus=([] if _dmode else already_shown))
 
     # ── Call 2: write the reply from the real data ──
-    reply, _was_valid = agent.generate_reply(
-        ((("Customer asks for the Diwali collection (spell it Diwali). Original message: " + message) if _dmode else message) + CARDS_INSTRUCTION) if cards else message,
-        understanding, verified_data, history)
+    if _recovered and not cards:
+        # STEP10_RECOVER: nothing to show, so behave exactly as before (old code answers)
+        print("[SALES-AGENT] STEP10 recovery found no available products - handing over to the old code")
+        _mark_failed()
+        return None
+    if _recovered:
+        reply, _was_valid = _fallback_intro(message), True  # STEP10_RECOVER: no second LLM call
+    else:
+        reply, _was_valid = agent.generate_reply(
+            ((("Customer asks for the Diwali collection (spell it Diwali). Original message: " + message) if _dmode else message) + CARDS_INSTRUCTION) if cards else message,
+            understanding, verified_data, history)
 
     if not cards and reply.lower().startswith("sorry, i'm having trouble"):
+        print("[SALES-AGENT] STEP10 second LLM call failed and there are no cards - old code answers")
         _mark_failed()
         return None  # second Groq call failed: let the old code answer
 
