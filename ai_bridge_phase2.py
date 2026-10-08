@@ -2179,6 +2179,43 @@ def ai_reply():
     message = data.get("message", "").strip()
     customer_id = data.get("customer_id", "")
     wa_number = data.get("wa_number", "")
+    # IMAGE_MATCH: customer sent a product image -> identify it -> same card as the SKU branch.
+    # Any failure or low confidence falls through to the existing flow unchanged.
+    if data.get("image_base64"):
+        try:
+            from image_branch import identify_product
+            _m = identify_product(data["image_base64"])
+            _ws = resolve_workspace_id(wa_number) if _m else None
+            if _m and _ws:
+                _sku = _m["sku"].replace("*", "").strip().upper()
+                _products = load_products()
+                _prod = next((p for p in _products if p.get("id") == _m["handle"]), None) \
+                    or find_product_by_sku(_sku, _products) or find_product_text_in_db(_sku, _ws)
+                if _prod:
+                    _details = parse_product_details(_prod)
+                    if not _details.get("Handle"):
+                        _details["Handle"] = _m["handle"]
+                    _reply, _image_url = build_product_reply(_details)
+                    remember_skus(customer_id, [_sku], workspace_id=_ws, wa_number=wa_number)
+                    print(f"[IMAGE-SKU] {_sku} -> {_details.get('Product', '')}")
+                    if message:
+                        log_message(customer_id, "incoming", message, workspace_id=_ws, wa_number=wa_number)
+                    log_message(customer_id, "outgoing", _reply, workspace_id=_ws, wa_number=wa_number)
+                    _out = {"reply": _reply, "image": _image_url, "type": "product"}
+                    # IMAGE_CAPTION: text sent with the picture is answered by the existing Sales Agent
+                    # (caption only, no new AI brain). Any doubt -> card only.
+                    if message:
+                        _ans = _try_sales_agent(message, customer_id, _ws, wa_number)
+                        if _ans and _ans.get("reply") and not _ans.get("images") and not _ans.get("cards"):
+                            _out["reply"] = _reply + "\n\n" + _ans["reply"]
+                            for _k, _v in _ans.items():
+                                if _k.startswith("handoff"):
+                                    _out[_k] = _v
+                            print(f"[IMAGE-CAPTION] {_sku} card + answer to caption")
+                    return jsonify(_out)
+        except Exception as _e:
+            print(f"[IMAGE] hook error, falling through: {_e}")
+
     if not message:
         return jsonify({"reply": "", "image": None, "type": "text"})
 
