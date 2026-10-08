@@ -2505,6 +2505,132 @@ def notify_matching_interests(sku, product_name, doc_text):
 
     for interest_id, customer_number in rows:
         prepare_followup_for_interest(interest_id, customer_number, category, color, sku, product_name, product_handle)
+# NEW_PRODUCT_PRIORITY: Shopify handle -> first-published time, kept in Postgres
+# (Render Free has no persistent disk, so invi_products.json cannot hold it).
+_ADDED_AT_CACHE = {"t": 0.0, "map": {}}
+
+
+def _ensure_added_at_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coexistence.product_added_at (
+            workspace_id INTEGER NOT NULL,
+            handle TEXT NOT NULL,
+            added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (workspace_id, handle)
+        )
+        """
+    )
+
+
+def record_added_at(handle, added_at=None):
+    """Stamp a product's first-published time (Shopify's published_at; now() if missing).
+    ON CONFLICT DO NOTHING: an existing stamp is never overwritten. Never raises."""
+    if not handle:
+        return
+    conn = None
+    try:
+        ws = resolve_sole_active_workspace()
+        if not ws:
+            return
+        conn = get_db_conn()
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            _ensure_added_at_table(cur)
+            cur.execute(
+                "INSERT INTO coexistence.product_added_at (workspace_id, handle, added_at) "
+                "VALUES (%s, %s, COALESCE(%s::timestamptz, now())) "
+                "ON CONFLICT (workspace_id, handle) DO NOTHING",
+                (ws, handle, added_at),
+            )
+        conn.commit()
+        _ADDED_AT_CACHE["t"] = 0.0
+    except Exception as e:
+        print(f"[DB] record_added_at failed: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def clear_added_at(handle):
+    """Product was unpublished: drop its stamp so a later re-publish can count as new. Never raises."""
+    if not handle:
+        return
+    conn = None
+    try:
+        ws = resolve_sole_active_workspace()
+        if not ws:
+            return
+        conn = get_db_conn()
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            _ensure_added_at_table(cur)
+            cur.execute(
+                "DELETE FROM coexistence.product_added_at WHERE workspace_id = %s AND handle = %s",
+                (ws, handle),
+            )
+        conn.commit()
+        _ADDED_AT_CACHE["t"] = 0.0
+    except Exception as e:
+        print(f"[DB] clear_added_at failed: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def get_added_at_map(use_cache=True):
+    """{handle: ISO timestamp}. {} on any failure (then nothing is treated as new). 60s cache."""
+    import time as _t
+    if use_cache and _ADDED_AT_CACHE["t"] and (_t.time() - _ADDED_AT_CACHE["t"] < 60):
+        return dict(_ADDED_AT_CACHE["map"])
+    conn = None
+    try:
+        ws = resolve_sole_active_workspace()
+        if not ws:
+            return {}
+        conn = get_db_conn()
+        if not conn:
+            return {}
+        with conn.cursor() as cur:
+            _ensure_added_at_table(cur)
+            cur.execute(
+                "SELECT handle, added_at FROM coexistence.product_added_at WHERE workspace_id = %s",
+                (ws,),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+        out = {h: (a.isoformat() if hasattr(a, "isoformat") else str(a)) for h, a in rows}
+        _ADDED_AT_CACHE["map"], _ADDED_AT_CACHE["t"] = out, _t.time()
+        return dict(out)
+    except Exception as e:
+        print(f"[DB] get_added_at_map failed: {e}")
+        return {}
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 @app.route("/shopify/product-created", methods=["POST"])
 def shopify_product_created():
     raw_body = verify_shopify_webhook(request)
@@ -2522,6 +2648,7 @@ def shopify_product_created():
         products.append(doc)
         save_products(products)
         print(f"[SHOPIFY] Added new product: {doc['id']}")
+        record_added_at(doc['id'], product.get('published_at'))  # NEW_PRODUCT_PRIORITY
         details = parse_product_details(doc)
         stock_overlay_clear(doc['id'])  # STEP10_INVENTORY: a new product must not inherit stale stock state
         notify_matching_interests(details.get("SKU", ""), details.get("Product", doc['id']), doc["text"])
@@ -2553,6 +2680,12 @@ def shopify_product_updated():
         products.append(doc)
     save_products(products)
     print(f"[SHOPIFY] Updated product: {doc['id']} (published={is_published})")
+    # NEW_PRODUCT_PRIORITY: unpublished -> drop the stamp; newly published -> stamp with Shopify's published_at.
+    # A plain edit or restock of a product already in the catalog (found=True) never touches the stamp.
+    if not is_published:
+        clear_added_at(doc['id'])
+    elif not found:
+        record_added_at(doc['id'], product.get('published_at'))
     if (not is_published) or (not found):
         stock_overlay_clear(doc['id'])  # STEP10_INVENTORY: left or re-entered the catalog -> no stale stock state
     if is_published:

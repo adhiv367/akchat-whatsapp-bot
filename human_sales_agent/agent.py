@@ -160,9 +160,10 @@ def gather_verified_data(understanding, customer_id, workspace_id=None, wa_numbe
     query = understanding.get("search_query") or understanding.get("referenced_product_hint")
     if query:
         products = product_search.load_products()
-        results = product_search.search(query, products)
+        _k = max_products if max_products > 5 else 3  # NEW_PRODUCT_PRIORITY: only the wide request (30) widens the pool; the default stays 3
+        results = product_search.search(query, products, top_k=_k)
         if not results:
-            results = product_search.semantic_search_products(query, workspace_id=workspace_id)
+            results = product_search.semantic_search_products(query, top_k=_k, workspace_id=workspace_id)
         data["products"] = results[:max_products]
 
         # Real product photos for whatever the text search matched on —

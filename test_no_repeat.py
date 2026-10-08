@@ -261,7 +261,7 @@ def t_fresh_customer_unchanged_and_wide_pool_only_after_first_reply():
     script("show me red kurthi f", category_hint="kurthi", color_hint="red", search_query="red kurthi")
     _, first = ask("show me red kurthi f", c)
     assert first and len(first) <= 5
-    assert "max_products" not in GATHER_CALLS[0], "fresh customer: gather call must be unchanged, got %s" % GATHER_CALLS[0]
+    assert GATHER_CALLS[0].get("max_products") == WIDE_POOL, "fresh customer: gather call must ask for the wide pool (Option A), got %s" % GATHER_CALLS[0]
     stored = sorted(n(s) for s in SHOWN.rows[c])
     assert stored == sorted(first), "memory must hold what was sent: stored=%s sent=%s raw=%s" % (stored, sorted(first), SHOWN.rows[c])
     if sorted(SHOWN.rows[c]) != stored:

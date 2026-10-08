@@ -247,6 +247,62 @@ def _new_arrival_products(exclude_skus=None, limit=MAX_CARDS):
     return out[:limit]
 
 
+# NEW_PRODUCT_PRIORITY: newest products first. Dates live in Postgres (bridge: {handle: time});
+# here they are translated to {SKU: time} because the cards and the shown-history work with SKUs.
+def _added_map():
+    try:
+        by_handle = prod.get_added_at_map()
+        if not by_handle:
+            return {}
+        out = {}
+        for p in product_search.load_products():
+            h = p.get("id") or ""
+            if h in by_handle:
+                sku = _norm_sku(_text_sku(p.get("text", "")))
+                if sku:
+                    out[sku] = by_handle[h]
+        return out
+    except Exception as e:
+        print(f"[SALES-AGENT] added_at map skipped: {e}")
+        return {}
+
+
+def _added_ts(value):
+    try:
+        import datetime as _dt
+        d = _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone.utc)
+        return d.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _newest_first(texts, color=None, query=None):
+    """Reorder only, never drop. Relevance first (the words the customer asked for beyond the
+    generic category words, e.g. 'red', matched as whole words), then newest first. Products with
+    no date count as oldest and keep their incoming order."""
+    texts = list(texts or [])
+    try:
+        added = _added_map()
+        words = set()
+        for w in _re.findall(r"[a-z]+", ((query or "") + " " + (color or "")).lower()):
+            if len(w) > 1 and w not in GENERIC_WORDS:
+                words.add(w)
+        pats = [_re.compile(r"\b" + _re.escape(w) + r"\b") for w in words]
+
+        def _key(t):
+            body = "\n".join(ln for ln in t.split("\n") if not ln.lower().startswith("image:")).lower()
+            rel = sum(1 for p in pats if p.search(body))
+            d = added.get(_norm_sku(_text_sku(t)))
+            return (rel, _added_ts(d) if d else 0.0)
+
+        return sorted(texts, key=_key, reverse=True)
+    except Exception as e:
+        print(f"[SALES-AGENT] newest-first skipped: {e}")
+        return texts
+
+
 def _build_cards(product_texts, exclude_skus=None, max_cards=MAX_CARDS):
     """One card per product, same layout as the SKU lookup reply. Only the
     last card keeps the 'To order...' footer. Values come straight from the
@@ -403,7 +459,7 @@ def run(message, customer_id, workspace_id, wa_number):
             time.sleep(pause)
         # NO_REPEAT: once this customer has seen products, look at a wider candidate list so that
         # dropping the already-seen ones still leaves unseen matches. Fresh customers: call unchanged.
-        _kw = {"max_products": WIDE_POOL} if (already_shown and intent in CARD_INTENTS) else {}
+        _kw = {"max_products": WIDE_POOL} if intent in CARD_INTENTS else {}  # NEW_PRODUCT_PRIORITY: every category request, incl. brand-new customers
         verified_data = agent.gather_verified_data(
             understanding, customer_id, workspace_id=workspace_id, wa_number=wa_number, **_kw)
 
@@ -474,6 +530,7 @@ def run(message, customer_id, workspace_id, wa_number):
             cards = _build_cards(_prev or _cands, exclude_skus=[])
         else:
             # NO_REPEAT: browsing / new request - products already shown are dropped.
+            _cands = _newest_first(_cands, understanding.get("color_hint"), understanding.get("search_query") or understanding.get("referenced_product_hint"))  # NEW_PRODUCT_PRIORITY: relevance first, then newest; the shown filter comes after
             cards = _build_cards(_cands, exclude_skus=already_shown)
             _all_seen = (not cards) and any(_is_available(t) for t in _cands)
         # the reply step should only see the products that are actually being shown
