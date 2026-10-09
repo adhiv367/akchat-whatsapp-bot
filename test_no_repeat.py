@@ -58,6 +58,9 @@ prod._pending_followup_note = lambda *a, **k: None
 ps.semantic_search_products = lambda *a, **k: []
 ps.get_top_product_images = lambda *a, **k: []
 agent.policy.search_policy_faq = lambda *a, **k: []
+# SAFE TEST: no database at all. Without these, every sa.run() tried to connect to 127.0.0.1:1.
+prod.get_db_conn = lambda *a, **k: None
+prod.get_added_at_map = lambda *a, **k: {}
 agent.generate_reply = lambda message, understanding, verified_data, history: ("Here are some options \U0001F60A", True)
 
 BASE = dict(intent="PRODUCT_DISCOVERY", referenced_product_hint=None, category_hint=None, color_hint=None,
@@ -115,6 +118,19 @@ def browse_until_exhausted(message, customer, limit=60):
     return batches, last_reply
 
 
+def browse_until_restart(message, customer, limit=60):
+    """Repeat the message until Step 11 restarts the list. Returns (batches before restart, restart reply)."""
+    batches = []
+    for _ in range(limit):
+        out, skus = ask(message, customer)
+        reply = (out or {}).get("reply") or ""
+        if reply.startswith("You've now seen all our designs"):
+            return batches, reply
+        if skus:
+            batches.append(skus)
+    return batches, None
+
+
 def flat(batches):
     return [s for b in batches for s in b]
 
@@ -145,23 +161,23 @@ def t_test1_collection_then_salwar():
 def t_test3_same_category_never_repeats_then_exhausts():
     c = "t3"
     script("show me kurthis", category_hint="kurthi", search_query="kurthi")
-    batches, last = browse_until_exhausted("show me kurthis", c)
+    batches, last = browse_until_restart("show me kurthis", c)
     seen = flat(batches)
     assert len(seen) == len(set(seen)), "a product was shown twice: %s" % [s for s in seen if seen.count(s) > 1][:5]
     all_kurthi = {sku_of(t) for t in sa._by_category("cotton kurthi")}
-    assert set(seen) == all_kurthi, "should walk through the WHOLE category (%d of %d shown)" % (len(set(seen)), len(all_kurthi))
+    assert all_kurthi <= set(seen), "should walk through the WHOLE category (%d of %d shown)" % (len(all_kurthi & set(seen)), len(all_kurthi))
     assert len(batches) >= 3, "need >=3 replies to prove memory is longer than 15 SKUs (got %d)" % len(batches)
-    assert last == ALREADY_SEEN, "exhausted reply wrong: %r" % last
+    assert last and last.startswith("You've now seen all our designs"), "expected the Step 11 restart message, got %r" % last
 
 
 def t_test3b_colour_request_never_repeats():
     c = "t3b"
     script("show me red kurthi", category_hint="kurthi", color_hint="red", search_query="red kurthi")
-    batches, last = browse_until_exhausted("show me red kurthi", c)
+    batches, last = browse_until_restart("show me red kurthi", c)
     seen = flat(batches)
     assert seen, "red kurthi request showed nothing at all"
     assert len(seen) == len(set(seen)), "a product repeated: %s" % [s for s in seen if seen.count(s) > 1][:5]
-    assert last == ALREADY_SEEN, "after the matches run out the reply must be the already-seen message, got %r" % last
+    assert last and last.startswith("You've now seen all our designs"), "expected the Step 11 restart message, got %r" % last
     if len(batches) > 1:
         assert not set(batches[0]) & set(batches[1]), "2nd 'red kurthi' repeated cards from the 1st"
 
@@ -228,8 +244,8 @@ def t_test4_all_seen_gives_natural_reply_not_repeat():
         SHOWN.rows.setdefault(c, []).append(sku_of(t["text"]))
     script("show me kurthis all", category_hint="kurthi", search_query="kurthi")
     out, cards = ask("show me kurthis all", c)
-    assert not cards, "must not repeat when everything was seen"
-    assert out and out["reply"] == ALREADY_SEEN, "wrong reply: %r" % (out and out["reply"])
+    assert cards and len(cards) <= 5, "expected restart cards (max 5), got %r" % cards
+    assert out["reply"].startswith("You've now seen all our designs"), "wrong reply: %r" % (out and out["reply"])
 
 
 def t_new_arrivals_never_repeat_then_message():
@@ -239,10 +255,11 @@ def t_new_arrivals_never_repeat_then_message():
     if total == 0:
         print("      (no temp-new products in catalog - skipped)")
         return
-    batches, last = browse_until_exhausted("new arrivals", c)
+    batches, last = browse_until_restart("new arrivals", c)
     seen = flat(batches)
-    assert len(seen) == len(set(seen)) and len(seen) == total, "shown %d unique of %d" % (len(set(seen)), total)
-    assert last == ALREADY_SEEN_NEW, "wrong exhausted reply for new arrivals: %r" % last
+    new_skus = {sku_of(t) for t in sa._new_arrival_products(limit=10 ** 6)}
+    assert len(seen) == len(set(seen)) and new_skus <= set(seen), "repeat before restart, or new arrivals missed (%d of %d)" % (len(new_skus & set(seen)), total)
+    assert last and last.startswith("You've now seen all our designs"), "expected the Step 11 restart message, got %r" % last
 
 
 def t_groq_failed_discovery_still_does_not_repeat():
@@ -252,7 +269,9 @@ def t_groq_failed_discovery_still_does_not_repeat():
     script("show me kurthi", intent="OTHER", _error="groq down")
     out, cards = ask("show me kurthi", c)
     assert out is not None, "recovered path handed over to the old code (which could repeat)"
-    assert not cards and out["reply"] == ALREADY_SEEN, "got %r" % (out and out["reply"])
+    # Step 11: every design was seen, so the list restarts instead of a dead end.
+    assert cards and len(cards) <= 5, "expected restart cards (max 5), got %r" % cards
+    assert out["reply"].startswith("You've now seen all our designs"), "got %r" % (out and out["reply"])
 
 
 def t_fresh_customer_unchanged_and_wide_pool_only_after_first_reply():

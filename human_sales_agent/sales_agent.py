@@ -375,6 +375,64 @@ def _mark_failed():
         pass
 
 
+# STEP11_NO_DEAD_END: fresh dresses (or a restart) instead of "you have already seen these"
+FILL_MORE_REPLY = "Here are some fresh designs you haven't seen yet \U0001F60A"
+FILL_NEW_REPLY = ("You've seen all our current new arrivals \U0001F60A "
+                  "Here are some other fresh designs you haven't seen yet:")
+FILL_RESTART_REPLY = ("You've now seen all our designs \U0001F60A "
+                      "Here they are again from the start:")
+
+
+def _is_test_product(text):
+    sku = _norm_sku(_text_sku(text))
+    tags = next((ln for ln in text.split("\n") if ln.lower().startswith("tags:")), "")
+    tag_list = [x.strip() for x in tags.split(":", 1)[-1].lower().split(",")]
+    return sku.startswith("TEST") or "test" in tag_list
+
+
+def _fill_text(message, english):
+    # Tamil customers keep the existing Tamil intro
+    if any("\u0b80" <= ch <= "\u0bff" for ch in (message or "")):
+        return _fallback_intro(message)
+    return english
+
+
+def _fresh_fill(shown, matching, limit=MAX_CARDS):
+    # Returns (product_texts, "fresh" | "restart") or None when nothing can be shown.
+    # fresh   = in-stock, non-test products this customer has not seen: same group first, newest first.
+    # restart = every in-stock product was already seen: oldest-shown first, same group first.
+    try:
+        seen = {_norm_sku(s) for s in (shown or [])}
+        by_sku = {}
+        for p in product_search.load_products():
+            t = p.get("text", "")
+            sku = _norm_sku(_text_sku(t))
+            if not sku or sku in by_sku or _is_test_product(t) or not _is_available(t):
+                continue
+            by_sku[sku] = t
+        types = {_type_of(t) for t in (matching or []) if _type_of(t)}
+
+        def _group_first(texts):
+            same = [t for t in texts if _type_of(t) in types]
+            return same + [t for t in texts if _type_of(t) not in types]
+
+        fresh = [t for sku, t in by_sku.items() if sku not in seen]
+        if fresh:
+            return _group_first(_newest_first(fresh))[:limit], "fresh"
+        order = []
+        for s in reversed(list(shown or [])):  # shown list is most-recent-first
+            n = _norm_sku(s)
+            if n in by_sku and n not in order:
+                order.append(n)
+        again = [by_sku[n] for n in order]
+        if again:
+            return _group_first(again)[:limit], "restart"
+        return None
+    except Exception as e:
+        print("[SALES-AGENT] STEP11 fill skipped: %s" % e)
+        return None
+
+
 def run(message, customer_id, workspace_id, wa_number):
     # Fixed rule: SKU messages are handled by the existing SKU code in /ai.
     if SKU_PATTERN.search(message):
@@ -437,17 +495,27 @@ def run(message, customer_id, workspace_id, wa_number):
             return _result(understanding, _order_reply(message, customer_id, workspace_id))
 
     # ── Existing product data ──
+    _fill_reply = None  # STEP11: fixed intro when fresh/restart dresses replace a dead end
     already_shown = _get_shown(customer_id, workspace_id, wa_number)  # NO_REPEAT: was limited to 15
 
     if intent == "NEW_ARRIVALS" and not handoff:
         new_products = _new_arrival_products(exclude_skus=([] if _ref else already_shown),
                                              limit=(WIDE_POOL if _ref else MAX_CARDS))
+        _diwali_msg = (str(understanding.get("collection") or "").lower() == "diwali") or bool(DIWALI_RE.search(message or ""))  # STEP11
         if not new_products:
             if already_shown and not _ref and _new_arrival_products(limit=1):
                 # NO_REPEAT: there ARE new arrivals, this customer has simply seen them all
-                return _result(understanding, ALREADY_SEEN_NEW_REPLY)
-            # STEP6B: no new arrivals -> say so honestly, never fall back to generic products
-            return _result(understanding, prod.NEW_ARRIVALS_NONE_REPLY)
+                # STEP11: show fresh dresses (or restart) instead of stopping. A Diwali request is
+                # not trapped here: it falls through to the Diwali block below.
+                _fill = None if _diwali_msg else _fresh_fill(already_shown, _new_arrival_products(limit=1000))
+                if _fill:
+                    new_products, _kind = _fill
+                    _fill_reply = _fill_text(message, FILL_NEW_REPLY if _kind == "fresh" else FILL_RESTART_REPLY)
+                elif not _diwali_msg:
+                    return _result(understanding, ALREADY_SEEN_NEW_REPLY)
+            elif not _diwali_msg:
+                # STEP6B: no new arrivals -> say so honestly, never fall back to generic products
+                return _result(understanding, prod.NEW_ARRIVALS_NONE_REPLY)
         verified_data = {"products": new_products, "orders": [], "images": [], "policy": []}
         understanding["intent"] = "PRODUCT_DISCOVERY"
         pause = _pause_seconds()
@@ -465,7 +533,7 @@ def run(message, customer_id, workspace_id, wa_number):
 
     # CATEGORY_FILTER: a plain category request ("show me kurthis") must return that category only.
     try:
-        if intent in CARD_INTENTS and not handoff:
+        if intent in CARD_INTENTS and not handoff and not _fill_reply:  # STEP11
             _q = understanding.get("search_query") or understanding.get("referenced_product_hint") or ""
             _cat = _category_of(understanding.get("category_hint"), _q)
             if _cat:
@@ -521,7 +589,7 @@ def run(message, customer_id, workspace_id, wa_number):
             and verified_data.get("products")):
         _cands = verified_data["products"]
         _seen_set = {_norm_sku(s) for s in already_shown}
-        if _dmode:
+        if _dmode or _fill_reply:  # STEP11: fill products are already fresh/restart, no exclusion
             cards = _build_cards(_cands, exclude_skus=[])
         elif _ref and _seen_set:
             # NO_REPEAT exception: the customer points at something already shown, so show that
@@ -541,6 +609,56 @@ def run(message, customer_id, workspace_id, wa_number):
             verified_data["products"] = _cands[:MAX_CARDS]
 
     if _all_seen:
+        # STEP11: show fresh dresses (or restart) instead of stopping; old message if nothing can be filled
+        _fill = _fresh_fill(already_shown, _cands)
+        if _fill:
+            _ftexts, _kind = _fill
+            cards = _build_cards(_ftexts, exclude_skus=[])
+            if cards:
+                _fill_reply = _fill_text(message, FILL_MORE_REPLY if _kind == "fresh" else FILL_RESTART_REPLY)
+                _on_cards = {_norm_sku(c["sku"]) for c in cards}
+                verified_data["products"] = [t for t in _ftexts if _norm_sku(_text_sku(t)) in _on_cards] or _ftexts[:MAX_CARDS]
+                _all_seen = False
+
+    # STEP13: a bare "anything else" / "more" with nothing to show (the search had no query, or the
+    # intent was not a card intent) but this customer has already been shown products: continue with
+    # unseen dresses from the whole catalog (or restart), never a dead end or a free-text category question.
+    if (not cards and not _all_seen and not _fill_reply and not handoff and not _ref
+            and already_shown and understanding.get("wants_more") is True
+            and not understanding.get("color_hint") and not understanding.get("category_hint")
+            and understanding.get("intent") in (CARD_INTENTS | {"OTHER"})):
+        _fill = _fresh_fill(already_shown, [])
+        if _fill:
+            _ftexts, _kind = _fill
+            cards = _build_cards(_ftexts, exclude_skus=[])
+            if cards:
+                _fill_reply = _fill_text(message, FILL_MORE_REPLY if _kind == "fresh" else FILL_RESTART_REPLY)
+                _on_cards = {_norm_sku(c["sku"]) for c in cards}
+                verified_data["products"] = [t for t in _ftexts if _norm_sku(_text_sku(t)) in _on_cards] or _ftexts[:MAX_CARDS]
+                understanding["intent"] = "PRODUCT_DISCOVERY"
+
+    if _all_seen:
+        # STEP14: last-resort fill. _fresh_fill returned nothing (error or empty), so show the first
+        # available, non-test products instead of a dead end. Same cards, same five-card maximum.
+        try:
+            _last = []
+            for _p in product_search.load_products():
+                _t = _p.get("text", "")
+                if _is_available(_t) and not _is_test_product(_t) and _norm_sku(_text_sku(_t)):
+                    _last.append(_t)
+                if len(_last) >= MAX_CARDS:
+                    break
+            cards = _build_cards(_last, exclude_skus=[]) if _last else []
+        except Exception as _e:
+            print("[SALES-AGENT] STEP14 last-resort fill failed: %s" % _e)
+            cards = []
+        if cards:
+            _fill_reply = _fill_text(message, FILL_RESTART_REPLY)
+            _on_cards = {_norm_sku(c["sku"]) for c in cards}
+            verified_data["products"] = [t for t in _last if _norm_sku(_text_sku(t)) in _on_cards] or _last[:MAX_CARDS]
+            understanding["intent"] = "PRODUCT_DISCOVERY"
+            _all_seen = False
+    if _all_seen:
         # NO_REPEAT (Option A): everything that matches was already shown - do not repeat it.
         print("[SALES-AGENT] NO_REPEAT all matching products were already shown to this customer")
         return _result(understanding, ALREADY_SEEN_REPLY)
@@ -551,7 +669,9 @@ def run(message, customer_id, workspace_id, wa_number):
         print("[SALES-AGENT] STEP10 recovery found no available products - handing over to the old code")
         _mark_failed()
         return None
-    if _recovered:
+    if _fill_reply:
+        reply, _was_valid = _fill_reply, True  # STEP11: fixed text, no LLM call
+    elif _recovered:
         reply, _was_valid = _fallback_intro(message), True  # STEP10_RECOVER: no second LLM call
     else:
         reply, _was_valid = agent.generate_reply(
