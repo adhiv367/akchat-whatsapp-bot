@@ -353,7 +353,7 @@ def _has_order_details(message):
 # Plain browse / suggest / gift messages get product cards (no LLM); anything that mentions
 # orders, refunds, offers etc. still goes to the old code exactly as before.
 _DISCOVERY_RE = _re.compile(
-    r"\b(suggest|recommend|gift|show me|dress(?:es)?|kurt(?:a|i|ha|hi)s?|salwar|co-?ords?|designs?|options?)\b",
+    r"\b(suggest|recommend|gift|show me|dress(?:es)?|kurt(?:a|i|ha|hi)s?|salwar|co-?ords?|designs?|options?|raw[\s-]*silks?)\b",
     _re.I)
 _NOT_DISCOVERY_RE = _re.compile(
     r"\b(?:order|refund|cancel|return|exchange|track|status|complain|delay|damag|wrong|pay|paid|invoice|discount|offer|coupon|cod|deliver)",
