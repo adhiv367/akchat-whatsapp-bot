@@ -612,7 +612,7 @@ def run(message, customer_id, workspace_id, wa_number):
 
     if _all_seen:
         # STEP11: show fresh dresses (or restart) instead of stopping; old message if nothing can be filled
-        _fill = _fresh_fill(already_shown, _cands, strict=True)
+        _fill = _fresh_fill(already_shown, _cands, strict=bool(_category_of(understanding.get("category_hint"), understanding.get("search_query") or understanding.get("referenced_product_hint") or "")))
         if _fill:
             _ftexts, _kind = _fill
             cards = _build_cards(_ftexts, exclude_skus=[])
