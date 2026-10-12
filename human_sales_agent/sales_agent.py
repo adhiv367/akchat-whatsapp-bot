@@ -421,11 +421,12 @@ def _fresh_fill(shown, matching, limit=MAX_CARDS, strict=False):
         fresh = [t for sku, t in by_sku.items() if sku not in seen]
         if fresh:
             return _group_first(_newest_first(fresh))[:limit], "fresh"
-        order = []
-        for s in reversed(list(shown or [])):  # shown list is most-recent-first
+        latest = []
+        for s in (shown or []):  # shown list is most-recent-first: first hit = latest showing
             n = _norm_sku(s)
-            if n in by_sku and n not in order:
-                order.append(n)
+            if n in by_sku and n not in latest:
+                latest.append(n)
+        order = list(reversed(latest))  # least recently shown first
         again = [by_sku[n] for n in order]
         if again:
             return _group_first(again)[:limit], "restart"
