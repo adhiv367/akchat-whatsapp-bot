@@ -1710,6 +1710,33 @@ def _sales_agent_enabled():
     return os.environ.get("SALES_AGENT_ENABLED", "false").strip().lower() == "true"
 
 
+# OLD_TEMPLATE_GUARD: after the Sales Agent's AI steps failed, the old /ai code can still let
+# ask_groq write the numbered "SKU / View & Order" product list. Replace only that.
+def _sales_agent_failed():
+    try:
+        from flask import g
+        return bool(getattr(g, "sales_agent_failed", False))
+    except Exception:
+        return False
+
+
+OLD_TEMPLATE_FALLBACK_REPLY = ("Let me pull up the right designs for you \U0001F60A "
+                               "Could you tell me the type you'd like (kurthi, kurthi set or salwar set) "
+                               "and a colour or budget if you have one?")
+
+
+def _is_old_product_template(reply):
+    r = reply or ""
+    return "View & Order" in r and "SKU:" in r and bool(re.search(r"(?m)^\s*1\.\s", r))
+
+
+def _guard_old_template(reply):
+    if _sales_agent_failed() and _is_old_product_template(reply):
+        print("[OLD-TEMPLATE-GUARD] blocked old product-list template after the agent failed")
+        return OLD_TEMPLATE_FALLBACK_REPLY
+    return reply
+
+
 def _try_sales_agent(message, customer_id, workspace_id, wa_number):
     """Returns the Human Sales Agent's answer (a dict), or None when the agent is
     off, has nothing to say, or hits ANY error. None means: /ai carries on with
@@ -2426,6 +2453,7 @@ def ai_reply():
     _closing_ok = detected_intent in BUYING_INTENTS and not _is_memory_question(message)
     reply = ask_groq(message, context, conversation_history, policy_context, show_closing_line=_closing_ok, followup_note=_pending_followup_note(customer_id, workspace_id, wa_number))  # PHASE 5: policy added
     is_valid, reply = validate_reply(reply, context, policy_context, products)  # PHASE 6
+    reply = _guard_old_template(reply)  # OLD_TEMPLATE_GUARD
     print(f"[GROQ] {message}" + ("" if is_valid else " [PHASE6: blocked unverified price]"))
     log_message(customer_id, "outgoing", reply, workspace_id=workspace_id, wa_number=wa_number)  # PHASE 2
     return jsonify({
