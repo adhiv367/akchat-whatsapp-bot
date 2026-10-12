@@ -397,7 +397,7 @@ def _fill_text(message, english):
     return english
 
 
-def _fresh_fill(shown, matching, limit=MAX_CARDS, strict=False):
+def _fresh_fill(shown, matching, limit=MAX_CARDS):
     # Returns (product_texts, "fresh" | "restart") or None when nothing can be shown.
     # fresh   = in-stock, non-test products this customer has not seen: same group first, newest first.
     # restart = every in-stock product was already seen: oldest-shown first, same group first.
@@ -411,8 +411,6 @@ def _fresh_fill(shown, matching, limit=MAX_CARDS, strict=False):
                 continue
             by_sku[sku] = t
         types = {_type_of(t) for t in (matching or []) if _type_of(t)}
-        if strict and types:  # CATEGORY_GUARD: a category request never fills with other categories
-            by_sku = {k: v for k, v in by_sku.items() if _type_of(v) in types}
 
         def _group_first(texts):
             same = [t for t in texts if _type_of(t) in types]
@@ -612,7 +610,7 @@ def run(message, customer_id, workspace_id, wa_number):
 
     if _all_seen:
         # STEP11: show fresh dresses (or restart) instead of stopping; old message if nothing can be filled
-        _fill = _fresh_fill(already_shown, _cands, strict=bool(_category_of(understanding.get("category_hint"), understanding.get("search_query") or understanding.get("referenced_product_hint") or "")))
+        _fill = _fresh_fill(already_shown, _cands)
         if _fill:
             _ftexts, _kind = _fill
             cards = _build_cards(_ftexts, exclude_skus=[])
