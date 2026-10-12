@@ -18,7 +18,7 @@ if ROOT not in sys.path:
 import test_no_repeat as T  # noqa: E402
 
 sa, ps = T.sa, T.ps
-RESTART = "You've now seen all our designs"
+RESTART = "Here are some more designs for you"
 
 
 def eligible_salwar():

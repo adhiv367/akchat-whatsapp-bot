@@ -124,7 +124,7 @@ def browse_until_restart(message, customer, limit=60):
     for _ in range(limit):
         out, skus = ask(message, customer)
         reply = (out or {}).get("reply") or ""
-        if reply.startswith("You've now seen all our designs"):
+        if reply.startswith("Here are some more designs for you"):
             return batches, reply
         if skus:
             batches.append(skus)
@@ -167,7 +167,7 @@ def t_test3_same_category_never_repeats_then_exhausts():
     all_kurthi = {sku_of(t) for t in sa._by_category("cotton kurthi")}
     assert all_kurthi <= set(seen), "should walk through the WHOLE category (%d of %d shown)" % (len(all_kurthi & set(seen)), len(all_kurthi))
     assert len(batches) >= 3, "need >=3 replies to prove memory is longer than 15 SKUs (got %d)" % len(batches)
-    assert last and last.startswith("You've now seen all our designs"), "expected the Step 11 restart message, got %r" % last
+    assert last and last.startswith("Here are some more designs for you"), "expected the Step 11 restart message, got %r" % last
 
 
 def t_test3b_colour_request_never_repeats():
@@ -177,7 +177,7 @@ def t_test3b_colour_request_never_repeats():
     seen = flat(batches)
     assert seen, "red kurthi request showed nothing at all"
     assert len(seen) == len(set(seen)), "a product repeated: %s" % [s for s in seen if seen.count(s) > 1][:5]
-    assert last and last.startswith("You've now seen all our designs"), "expected the Step 11 restart message, got %r" % last
+    assert last and last.startswith("Here are some more designs for you"), "expected the Step 11 restart message, got %r" % last
     if len(batches) > 1:
         assert not set(batches[0]) & set(batches[1]), "2nd 'red kurthi' repeated cards from the 1st"
 
@@ -245,7 +245,7 @@ def t_test4_all_seen_gives_natural_reply_not_repeat():
     script("show me kurthis all", category_hint="kurthi", search_query="kurthi")
     out, cards = ask("show me kurthis all", c)
     assert cards and len(cards) <= 5, "expected restart cards (max 5), got %r" % cards
-    assert out["reply"].startswith("You've now seen all our designs"), "wrong reply: %r" % (out and out["reply"])
+    assert out["reply"].startswith("Here are some more designs for you"), "wrong reply: %r" % (out and out["reply"])
 
 
 def t_new_arrivals_never_repeat_then_message():
@@ -259,7 +259,7 @@ def t_new_arrivals_never_repeat_then_message():
     seen = flat(batches)
     new_skus = {sku_of(t) for t in sa._new_arrival_products(limit=10 ** 6)}
     assert len(seen) == len(set(seen)) and new_skus <= set(seen), "repeat before restart, or new arrivals missed (%d of %d)" % (len(new_skus & set(seen)), total)
-    assert last and last.startswith("You've now seen all our designs"), "expected the Step 11 restart message, got %r" % last
+    assert last and last.startswith("Here are some more designs for you"), "expected the Step 11 restart message, got %r" % last
 
 
 def t_groq_failed_discovery_still_does_not_repeat():
@@ -271,7 +271,7 @@ def t_groq_failed_discovery_still_does_not_repeat():
     assert out is not None, "recovered path handed over to the old code (which could repeat)"
     # Step 11: every design was seen, so the list restarts instead of a dead end.
     assert cards and len(cards) <= 5, "expected restart cards (max 5), got %r" % cards
-    assert out["reply"].startswith("You've now seen all our designs"), "got %r" % (out and out["reply"])
+    assert out["reply"].startswith("Here are some more designs for you"), "got %r" % (out and out["reply"])
 
 
 def t_fresh_customer_unchanged_and_wide_pool_only_after_first_reply():
