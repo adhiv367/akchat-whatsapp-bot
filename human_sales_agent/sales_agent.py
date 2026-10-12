@@ -379,8 +379,7 @@ def _mark_failed():
 FILL_MORE_REPLY = "Here are some fresh designs you haven't seen yet \U0001F60A"
 FILL_NEW_REPLY = ("You've seen all our current new arrivals \U0001F60A "
                   "Here are some other fresh designs you haven't seen yet:")
-FILL_RESTART_REPLY = ("You've now seen all our designs \U0001F60A "
-                      "Here they are again from the start:")
+FILL_RESTART_REPLY = "Here are some more designs for you \U0001F60A"
 
 
 def _is_test_product(text):
