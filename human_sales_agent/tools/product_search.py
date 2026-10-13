@@ -11,4 +11,5 @@ from ai_bridge_phase2 import (
     # imports, nothing duplicated or reimplemented here.
     get_top_product_images,
     build_product_reply,
+    build_product_link,  # CTA button link for product cards
 )

@@ -319,7 +319,7 @@ def _build_cards(product_texts, exclude_skus=None, max_cards=MAX_CARDS):
         if sku in seen:
             continue
         seen.add(sku)
-        cards.append({"sku": sku, "name": details.get("Product", ""), "image": image, "text": text})
+        cards.append({"sku": sku, "name": details.get("Product", ""), "image": image, "text": text, "cta_url": product_search.build_product_link(details)})
         if len(cards) >= max_cards:
             break
     for c in cards[:-1]:
