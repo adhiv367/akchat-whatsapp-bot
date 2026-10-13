@@ -614,11 +614,19 @@ def build_product_reply(details):
 👚 Sleeve: {sleeve}
 👔 Neckline: {neckline}
 ✅ Status: {status}
-🔗 View & Order: {product_link}
 
 To order, reply with your *size* and we will process it! 😊"""
 
     return reply, image if image else None
+
+
+def build_product_link(details):
+    """Product page URL used by the View & Order Now button (same logic as build_product_reply)."""
+    sku = details.get("SKU", "")
+    handle = details.get("Handle", "") or details.get("handle", "")
+    if not handle:
+        handle = sku.lower().replace(" ", "-") if sku else ""
+    return f"https://www.invicreation.com/products/{handle}" if handle else "https://www.invicreation.com"
 
 def search(query, products, top_k=3):
     query_words = set(query.lower().split())
@@ -2228,7 +2236,7 @@ def ai_reply():
                     if message:
                         log_message(customer_id, "incoming", message, workspace_id=_ws, wa_number=wa_number)
                     log_message(customer_id, "outgoing", _reply, workspace_id=_ws, wa_number=wa_number)
-                    _out = {"reply": _reply, "image": _image_url, "type": "product"}
+                    _out = {"reply": _reply, "image": _image_url, "type": "product", "cta_url": build_product_link(_details)}
                     # IMAGE_CAPTION: text sent with the picture is answered by the existing Sales Agent
                     # (caption only, no new AI brain). Any doubt -> card only.
                     if message:
@@ -2338,7 +2346,8 @@ def ai_reply():
             return jsonify({
                 "reply": reply,
                 "image": image_url,
-                "type": "product"
+                "type": "product",
+                "cta_url": build_product_link(details)
             })
         else:
             not_found_reply = f"Sorry, I could not find product *{sku}*. Please check the SKU and try again. You can browse our collection at https://www.invicreation.com 😊"
